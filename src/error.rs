@@ -24,6 +24,8 @@ pub enum PinocchioError {
     CannotAddParticipantsAfterCliff,
     #[error("Claim exceeds allocated amount")]
     ClaimExceedsAllocation,
+    #[error("Nonexistent seed value")]
+    InvalidSeed,
 }
 
 impl From<PinocchioError> for ProgramError {

@@ -67,6 +67,10 @@ impl TryFrom<&[u8]> for InitializeInstructionData {
             u8::from_le_bytes(data[40..41].try_into().unwrap()),
         );
 
+        if seed == 0 {
+            return Err(PinocchioError::InvalidSeed.into());
+        }
+
         let current_timestamp = Clock::get()?.unix_timestamp as u64;
         if start_timestamp < current_timestamp {
             return Err(PinocchioError::StartTimestampInPast.into());
