@@ -7,7 +7,8 @@ use pinocchio::{
 use pinocchio_token::{instructions::Transfer, state::TokenAccount};
 
 use crate::{
-    AssociatedToken, PinocchioError, ProgramAccount, SignerAccount, VestParticipant, VestSchedule,
+    AssociatedToken, Mint, PinocchioError, ProgramAccount, SignerAccount, VestParticipant,
+    VestSchedule,
 };
 
 pub struct ClaimAccounts<'a> {
@@ -35,9 +36,10 @@ impl<'a> TryFrom<&'a [AccountInfo]> for ClaimAccounts<'a> {
         SignerAccount::check(participant)?;
         ProgramAccount::check_token_program(token_program)?;
         ProgramAccount::check_system_program(system_program)?;
+        ProgramAccount::check_ata_program(ata_program)?;
         ProgramAccount::check::<VestSchedule>(vest_schedule)?;
         ProgramAccount::check::<VestParticipant>(participant_state)?;
-        ProgramAccount::check_ata_program(ata_program)?;
+        Mint::check(token_mint)?;
 
         Ok(Self {
             participant,
