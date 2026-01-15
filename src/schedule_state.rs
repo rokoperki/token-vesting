@@ -2,7 +2,6 @@ use pinocchio::{program_error::ProgramError, pubkey::Pubkey};
 
 #[repr(C, packed)]
 pub struct VestSchedule {
-    status: u8,
     token_mint: Pubkey,
     authority: Pubkey,
     seed: u64,
@@ -22,7 +21,7 @@ pub enum VestStatus {
 }
 
 impl VestSchedule {
-    pub const LEN: usize = size_of::<Pubkey>() * 2 + size_of::<u64>() * 5 + size_of::<u8>() * 2;
+    pub const LEN: usize = size_of::<Pubkey>() * 2 + size_of::<u64>() * 5 + size_of::<u8>();
 
     #[inline(always)]
     pub fn load_mut(bytes: &mut [u8]) -> Result<&mut Self, ProgramError> {
@@ -66,10 +65,10 @@ impl VestSchedule {
 
         vested_amount.saturating_sub(claimed_amount)
     }
-
+    
     #[inline(always)]
-    pub fn status(&self) -> u8 {
-        self.status
+    pub fn is_cliff_completed(&self, current_timestamp: u64) -> bool {
+        current_timestamp >= self.start_timestamp + self.cliff_duration
     }
 
     #[inline(always)]
@@ -113,19 +112,8 @@ impl VestSchedule {
     }
 
     #[inline(always)]
-    pub fn set_status(&mut self, status: u8) -> Result<(), ProgramError> {
-        if status > VestStatus::Completed as u8 {
-            return Err(ProgramError::InvalidAccountData);
-        }
-
-        self.status = status;
-        Ok(())
-    }
-
-    #[inline(always)]
     pub fn set_inner(
         &mut self,
-        status: u8,
         token_mint: Pubkey,
         authority: Pubkey,
         seed: u64,
@@ -135,7 +123,6 @@ impl VestSchedule {
         step_duration: u64,
         bump: u8,
     ) {
-        self.status = status;
         self.token_mint = token_mint;
         self.authority = authority;
         self.seed = seed;

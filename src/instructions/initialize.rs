@@ -6,7 +6,7 @@ use pinocchio::{
     ProgramResult,
 };
 
-use crate::{Mint, PinocchioError, ProgramAccount, SignerAccount, VestSchedule, VestStatus};
+use crate::{Mint, PinocchioError, ProgramAccount, SignerAccount, VestSchedule};
 
 pub struct InitializeAccounts<'a> {
     pub initializer: &'a AccountInfo,
@@ -72,8 +72,8 @@ impl TryFrom<&[u8]> for InitializeInstructionData {
             return Err(PinocchioError::StartTimestampInPast.into());
         }
 
-        if cliff_duration > total_duration
-            || step_duration > total_duration
+        if cliff_duration >= total_duration
+            || step_duration >= total_duration
             || cliff_duration == 0
             || step_duration == 0
         {
@@ -152,7 +152,6 @@ impl<'a> Initialize<'a> {
         let vest_schedule = VestSchedule::load_mut(&mut vest_schedule_data)?;
 
         vest_schedule.set_inner(
-            VestStatus::NotStarted as u8,
             *self.accounts.token_mint.key(),
             *self.accounts.initializer.key(),
             self.instruction_data.seed,

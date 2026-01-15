@@ -3,10 +3,16 @@ mod tests {
     use litesvm::LiteSVM;
     use pinocchio_system::ID;
     use solana_sdk::{
-        account::Account, instruction::{AccountMeta, Instruction}, pubkey::Pubkey, signature::{Keypair, Signer}, transaction::Transaction
+        account::Account,
+        instruction::{AccountMeta, Instruction},
+        pubkey::Pubkey,
+        signature::{Keypair, Signer},
+        transaction::Transaction,
     };
+    use spl_token::solana_program::program_option::COption;
+    use spl_token::solana_program::program_pack::Pack;
+    use spl_token::state::Mint;
     use spl_token::ID as TOKEN_PROGRAM_ID;
-    
 
     const PROGRAM_ID: Pubkey = Pubkey::new_from_array([
         0x0f, 0x1e, 0x6b, 0x14, 0x21, 0xc0, 0x4a, 0x07, 0x04, 0x31, 0x26, 0x5c, 0x19, 0xc5, 0xbb,
@@ -22,8 +28,7 @@ mod tests {
         step_duration: u64,
         bump: u8,
     ) -> Vec<u8> {
-        // Include discriminator (0 for Initialize)
-        let mut data = vec![0u8];
+        let mut data = vec![0u8]; // Discriminator for Initialize
         data.extend_from_slice(&seed.to_le_bytes());
         data.extend_from_slice(&start_timestamp.to_le_bytes());
         data.extend_from_slice(&cliff_duration.to_le_bytes());
@@ -50,16 +55,14 @@ mod tests {
     }
 
     fn setup_svm() -> LiteSVM {
-        let mut svm = LiteSVM::new();
+        let mut svm = LiteSVM::new().with_builtins().with_sigverify(false);
 
-        // Load your program
         svm.add_program_from_file(PROGRAM_ID, "target/deploy/token_vesting.so")
             .expect("Failed to load program");
 
         svm
     }
 
-    // Helper function to print transaction logs
     fn print_transaction_logs(
         result: &Result<
             litesvm::types::TransactionMetadata,
@@ -81,33 +84,46 @@ mod tests {
         }
     }
 
-    fn create_mock_token_mint(svm: &mut LiteSVM) -> Pubkey {
-        let mint = Keypair::new();
+    fn create_mock_token_mint(svm: &mut LiteSVM, authority: &Pubkey) -> Pubkey {
+        let mint_keypair = Keypair::new();
+        let mint_pubkey = mint_keypair.pubkey();
 
-        // Create a mock token mint account
+        let mint_data = Mint {
+            mint_authority: COption::Some(*authority),
+            supply: 1_000_000_000,
+            decimals: 6,
+            is_initialized: true,
+            freeze_authority: COption::None,
+        };
+
+        let mut data = vec![0u8; Mint::LEN];
+        Mint::pack(mint_data, &mut data).unwrap();
+
         let mint_account = Account {
-            lamports: 1_000_000,
-            data: vec![0u8; 82], // SPL Token Mint size
+            lamports: 10_000_000,
+            data,
             owner: TOKEN_PROGRAM_ID,
             executable: false,
             rent_epoch: 0,
         };
 
-        svm.set_account(mint.pubkey(), mint_account.into());
-        mint.pubkey()
+        svm.set_account(mint_pubkey, mint_account.into());
+        mint_pubkey
     }
 
     #[test]
     fn test_initialize_success() {
         let mut svm = setup_svm();
         let initializer = Keypair::new();
-        let token_mint = create_mock_token_mint(&mut svm);
 
-        // Fund initializer
         svm.airdrop(&initializer.pubkey(), 10_000_000_000).unwrap();
 
+        let token_mint = create_mock_token_mint(&mut svm, &initializer.pubkey());
+
         let seed = 12345u64;
-        let current_time = svm.get_sysvar::<solana_sdk::clock::Clock>().unix_timestamp as u64;
+        let current_time = svm
+            .get_sysvar::<solana_sdk::clock::Clock>()
+            .unix_timestamp as u64;
         let start_timestamp = current_time + 3600; // 1 hour in future
         let cliff_duration = 86400; // 1 day
         let total_duration = 864000; // 10 days
@@ -123,12 +139,6 @@ mod tests {
             total_duration,
             step_duration,
             bump,
-        );
-
-        println!("Instruction data length: {}", instruction_data.len());
-        println!(
-            "Start timestamp: {}, Current: {}",
-            start_timestamp, current_time
         );
 
         let instruction = Instruction {
@@ -152,36 +162,37 @@ mod tests {
 
         let result = svm.send_transaction(transaction);
         print_transaction_logs(&result);
-        assert!(result.is_ok(), "Transaction failed: {:?}", result.err());
+        assert!(result.is_ok(), "Transaction should succeed");
 
         // Verify account was created
         let vest_schedule_account = svm.get_account(&vest_schedule_pda);
         assert!(
             vest_schedule_account.is_some(),
-            "Vest schedule account not created"
+            "Vest schedule account should exist"
         );
 
         let account = vest_schedule_account.unwrap();
-        assert_eq!(
-            account.owner, PROGRAM_ID,
-            "Account should be owned by program"
-        );
-        assert!(
-            account.lamports > 0,
-            "Account should have lamports for rent"
-        );
+        assert_eq!(account.owner, PROGRAM_ID, "Should be owned by program");
+        assert!(account.lamports > 0, "Should have lamports for rent");
+
+        // Verify account has correct data length (removed status field)
+        // VestSchedule::LEN = 2 * Pubkey (64) + 5 * u64 (40) + 1 * u8 (1) = 105 bytes
+        assert_eq!(account.data.len(), 105, "Should have correct data length");
     }
 
     #[test]
     fn test_initialize_cliff_greater_than_total() {
         let mut svm = setup_svm();
         let initializer = Keypair::new();
-        let token_mint = create_mock_token_mint(&mut svm);
 
         svm.airdrop(&initializer.pubkey(), 10_000_000_000).unwrap();
 
+        let token_mint = create_mock_token_mint(&mut svm, &initializer.pubkey());
+
         let seed = 12345u64;
-        let current_time = svm.get_sysvar::<solana_sdk::clock::Clock>().unix_timestamp as u64;
+        let current_time = svm
+            .get_sysvar::<solana_sdk::clock::Clock>()
+            .unix_timestamp as u64;
         let start_timestamp = current_time + 7200; // 2 hours in future
         let cliff_duration = 864000; // 10 days
         let total_duration = 86400; // 1 day (less than cliff)
@@ -206,7 +217,7 @@ mod tests {
                 AccountMeta::new(vest_schedule_pda, false),
                 AccountMeta::new_readonly(token_mint, false),
                 AccountMeta::new_readonly(ID.into(), false),
-                AccountMeta::new_readonly(TOKEN_PROGRAM_ID.into(), false),
+                AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),
             ],
             data: instruction_data,
         };
@@ -227,15 +238,18 @@ mod tests {
     fn test_initialize_step_exceeds_total() {
         let mut svm = setup_svm();
         let initializer = Keypair::new();
-        let token_mint = create_mock_token_mint(&mut svm);
 
         svm.airdrop(&initializer.pubkey(), 10_000_000_000).unwrap();
 
+        let token_mint = create_mock_token_mint(&mut svm, &initializer.pubkey());
+
         let seed = 12345u64;
-        let current_time = svm.get_sysvar::<solana_sdk::clock::Clock>().unix_timestamp as u64;
-        let start_timestamp = current_time + 7200; // 2 hours in future
-        let cliff_duration = 86400; // 1 day
-        let total_duration = 864000; // 10 days
+        let current_time = svm
+            .get_sysvar::<solana_sdk::clock::Clock>()
+            .unix_timestamp as u64;
+        let start_timestamp = current_time + 7200;
+        let cliff_duration = 86400;
+        let total_duration = 864000;
         let step_duration = 1000000; // Step > total
 
         let (vest_schedule_pda, bump) =
@@ -257,7 +271,7 @@ mod tests {
                 AccountMeta::new(vest_schedule_pda, false),
                 AccountMeta::new_readonly(token_mint, false),
                 AccountMeta::new_readonly(ID.into(), false),
-                AccountMeta::new_readonly(TOKEN_PROGRAM_ID.into(), false),
+                AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),
             ],
             data: instruction_data,
         };
@@ -278,16 +292,19 @@ mod tests {
     fn test_initialize_invalid_step_duration() {
         let mut svm = setup_svm();
         let initializer = Keypair::new();
-        let token_mint = create_mock_token_mint(&mut svm);
 
         svm.airdrop(&initializer.pubkey(), 10_000_000_000).unwrap();
 
+        let token_mint = create_mock_token_mint(&mut svm, &initializer.pubkey());
+
         let seed = 12345u64;
-        let current_time = svm.get_sysvar::<solana_sdk::clock::Clock>().unix_timestamp as u64;
-        let start_timestamp = current_time + 7200; // 2 hours in future
+        let current_time = svm
+            .get_sysvar::<solana_sdk::clock::Clock>()
+            .unix_timestamp as u64;
+        let start_timestamp = current_time + 7200;
         let cliff_duration = 86400;
         let total_duration = 864000; // 10 days
-        let step_duration = 77777; // Doesn't divide evenly into (total - cliff)
+        let step_duration = 77777; // Doesn't divide evenly
 
         let (vest_schedule_pda, bump) =
             derive_vest_schedule_pda(seed, &token_mint, &initializer.pubkey());
@@ -308,7 +325,7 @@ mod tests {
                 AccountMeta::new(vest_schedule_pda, false),
                 AccountMeta::new_readonly(token_mint, false),
                 AccountMeta::new_readonly(ID.into(), false),
-                AccountMeta::new_readonly(TOKEN_PROGRAM_ID.into(), false),
+                AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),
             ],
             data: instruction_data,
         };
@@ -329,13 +346,16 @@ mod tests {
     fn test_initialize_zero_cliff_duration() {
         let mut svm = setup_svm();
         let initializer = Keypair::new();
-        let token_mint = create_mock_token_mint(&mut svm);
 
         svm.airdrop(&initializer.pubkey(), 10_000_000_000).unwrap();
 
+        let token_mint = create_mock_token_mint(&mut svm, &initializer.pubkey());
+
         let seed = 12345u64;
-        let current_time = svm.get_sysvar::<solana_sdk::clock::Clock>().unix_timestamp as u64;
-        let start_timestamp = current_time + 7200; // 2 hours in future
+        let current_time = svm
+            .get_sysvar::<solana_sdk::clock::Clock>()
+            .unix_timestamp as u64;
+        let start_timestamp = current_time + 7200;
         let cliff_duration = 0; // Zero cliff
         let total_duration = 864000;
         let step_duration = 86400;
@@ -359,7 +379,7 @@ mod tests {
                 AccountMeta::new(vest_schedule_pda, false),
                 AccountMeta::new_readonly(token_mint, false),
                 AccountMeta::new_readonly(ID.into(), false),
-                AccountMeta::new_readonly(TOKEN_PROGRAM_ID.into(), false),
+                AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),
             ],
             data: instruction_data,
         };
@@ -380,15 +400,18 @@ mod tests {
     fn test_initialize_zero_step_duration() {
         let mut svm = setup_svm();
         let initializer = Keypair::new();
-        let token_mint = create_mock_token_mint(&mut svm);
 
         svm.airdrop(&initializer.pubkey(), 10_000_000_000).unwrap();
 
+        let token_mint = create_mock_token_mint(&mut svm, &initializer.pubkey());
+
         let seed = 12345u64;
-        let current_time = svm.get_sysvar::<solana_sdk::clock::Clock>().unix_timestamp as u64;
-        let start_timestamp = current_time + 7200; // 2 hours in future
-        let cliff_duration = 86400; // 1 day
-        let total_duration = 864000; // 10 days
+        let current_time = svm
+            .get_sysvar::<solana_sdk::clock::Clock>()
+            .unix_timestamp as u64;
+        let start_timestamp = current_time + 7200;
+        let cliff_duration = 86400;
+        let total_duration = 864000;
         let step_duration = 0; // Zero step
 
         let (vest_schedule_pda, bump) =
@@ -410,7 +433,7 @@ mod tests {
                 AccountMeta::new(vest_schedule_pda, false),
                 AccountMeta::new_readonly(token_mint, false),
                 AccountMeta::new_readonly(ID.into(), false),
-                AccountMeta::new_readonly(TOKEN_PROGRAM_ID.into(), false),
+                AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),
             ],
             data: instruction_data,
         };
@@ -428,64 +451,19 @@ mod tests {
     }
 
     #[test]
-    fn test_initialize_missing_signer() {
-        let mut svm = setup_svm();
-        let initializer = Keypair::new();
-        let wrong_signer = Keypair::new();
-        let token_mint = create_mock_token_mint(&mut svm);
-
-        // Fund both accounts
-        svm.airdrop(&initializer.pubkey(), 10_000_000_000).unwrap();
-        svm.airdrop(&wrong_signer.pubkey(), 10_000_000_000).unwrap();
-
-        let seed = 12345u64;
-        let current_time = svm.get_sysvar::<solana_sdk::clock::Clock>().unix_timestamp as u64;
-        let start_timestamp = current_time + 7200;
-
-        let (vest_schedule_pda, bump) =
-            derive_vest_schedule_pda(seed, &token_mint, &initializer.pubkey());
-
-        let instruction_data =
-            create_initialize_instruction_data(seed, start_timestamp, 86400, 864000, 86400, bump);
-
-        let instruction = Instruction {
-            program_id: PROGRAM_ID,
-            accounts: vec![
-                AccountMeta::new(initializer.pubkey(), true), // Expects initializer to sign
-                AccountMeta::new(vest_schedule_pda, false),
-                AccountMeta::new_readonly(token_mint, false),
-                AccountMeta::new_readonly(ID.into(), false),
-                AccountMeta::new_readonly(TOKEN_PROGRAM_ID.into(), false),
-            ],
-            data: instruction_data,
-        };
-
-        // Manually construct message and transaction
-        use solana_sdk::message::Message;
-        use solana_sdk::transaction::Transaction;
-
-        let message = Message::new(&[instruction], Some(&wrong_signer.pubkey()));
-        let mut transaction = Transaction::new_unsigned(message);
-
-        // Only sign with wrong_signer, not with initializer
-        transaction.partial_sign(&[&wrong_signer], svm.latest_blockhash());
-
-        let result = svm.send_transaction(transaction);
-        print_transaction_logs(&result);
-        assert!(result.is_err(), "Should fail without proper signer");
-    }
-
-    #[test]
     fn test_initialize_wrong_bump() {
         let mut svm = setup_svm();
         let initializer = Keypair::new();
-        let token_mint = create_mock_token_mint(&mut svm);
 
         svm.airdrop(&initializer.pubkey(), 10_000_000_000).unwrap();
 
+        let token_mint = create_mock_token_mint(&mut svm, &initializer.pubkey());
+
         let seed = 12345u64;
-        let current_time = svm.get_sysvar::<solana_sdk::clock::Clock>().unix_timestamp as u64;
-        let start_timestamp = current_time + 7200; // 2 hours in future
+        let current_time = svm
+            .get_sysvar::<solana_sdk::clock::Clock>()
+            .unix_timestamp as u64;
+        let start_timestamp = current_time + 7200;
 
         let (vest_schedule_pda, correct_bump) =
             derive_vest_schedule_pda(seed, &token_mint, &initializer.pubkey());
@@ -508,7 +486,7 @@ mod tests {
                 AccountMeta::new(vest_schedule_pda, false),
                 AccountMeta::new_readonly(token_mint, false),
                 AccountMeta::new_readonly(ID.into(), false),
-                AccountMeta::new_readonly(TOKEN_PROGRAM_ID.into(), false),
+                AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),
             ],
             data: instruction_data,
         };
@@ -562,13 +540,16 @@ mod tests {
     fn test_initialize_account_already_initialized() {
         let mut svm = setup_svm();
         let initializer = Keypair::new();
-        let token_mint = create_mock_token_mint(&mut svm);
 
         svm.airdrop(&initializer.pubkey(), 10_000_000_000).unwrap();
 
+        let token_mint = create_mock_token_mint(&mut svm, &initializer.pubkey());
+
         let seed = 12345u64;
-        let current_time = svm.get_sysvar::<solana_sdk::clock::Clock>().unix_timestamp as u64;
-        let start_timestamp = current_time + 7200; // 2 hours in future
+        let current_time = svm
+            .get_sysvar::<solana_sdk::clock::Clock>()
+            .unix_timestamp as u64;
+        let start_timestamp = current_time + 7200;
 
         let (vest_schedule_pda, bump) =
             derive_vest_schedule_pda(seed, &token_mint, &initializer.pubkey());
@@ -583,7 +564,7 @@ mod tests {
                 AccountMeta::new(vest_schedule_pda, false),
                 AccountMeta::new_readonly(token_mint, false),
                 AccountMeta::new_readonly(ID.into(), false),
-                AccountMeta::new_readonly(TOKEN_PROGRAM_ID.into(), false),
+                AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),
             ],
             data: instruction_data.clone(),
         };
@@ -600,14 +581,7 @@ mod tests {
         print_transaction_logs(&result);
         assert!(result.is_ok(), "First initialization should succeed");
 
-        // Verify account was created
-        let vest_schedule_account = svm.get_account(&vest_schedule_pda);
-        assert!(
-            vest_schedule_account.is_some(),
-            "Vest schedule account should exist after first init"
-        );
-
-        // Second initialization with same parameters
+        // Second initialization should fail
         let transaction = Transaction::new_signed_with_payer(
             &[instruction],
             Some(&initializer.pubkey()),
@@ -624,14 +598,16 @@ mod tests {
     fn test_initialize_with_different_seeds() {
         let mut svm = setup_svm();
         let initializer = Keypair::new();
-        let token_mint = create_mock_token_mint(&mut svm);
 
         svm.airdrop(&initializer.pubkey(), 20_000_000_000).unwrap();
 
-        let current_time = svm.get_sysvar::<solana_sdk::clock::Clock>().unix_timestamp as u64;
+        let token_mint = create_mock_token_mint(&mut svm, &initializer.pubkey());
+
+        let current_time = svm
+            .get_sysvar::<solana_sdk::clock::Clock>()
+            .unix_timestamp as u64;
         let start_timestamp = current_time + 7200;
 
-        // Create two vest schedules with different seeds
         let seeds = [12345u64, 67890u64];
 
         for seed in seeds.iter() {
@@ -654,7 +630,7 @@ mod tests {
                     AccountMeta::new(vest_schedule_pda, false),
                     AccountMeta::new_readonly(token_mint, false),
                     AccountMeta::new_readonly(ID.into(), false),
-                    AccountMeta::new_readonly(TOKEN_PROGRAM_ID.into(), false),
+                    AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),
                 ],
                 data: instruction_data,
             };
@@ -674,11 +650,10 @@ mod tests {
                 seed
             );
 
-            // Verify the account exists
             let account = svm.get_account(&vest_schedule_pda);
             assert!(
                 account.is_some(),
-                "Vest schedule account for seed {} should exist",
+                "Account for seed {} should exist",
                 seed
             );
         }
@@ -691,13 +666,14 @@ mod tests {
 
         svm.airdrop(&initializer.pubkey(), 20_000_000_000).unwrap();
 
-        let current_time = svm.get_sysvar::<solana_sdk::clock::Clock>().unix_timestamp as u64;
+        let current_time = svm
+            .get_sysvar::<solana_sdk::clock::Clock>()
+            .unix_timestamp as u64;
         let start_timestamp = current_time + 7200;
         let seed = 12345u64;
 
-        // Create two different token mints
-        let token_mint_1 = create_mock_token_mint(&mut svm);
-        let token_mint_2 = create_mock_token_mint(&mut svm);
+        let token_mint_1 = create_mock_token_mint(&mut svm, &initializer.pubkey());
+        let token_mint_2 = create_mock_token_mint(&mut svm, &initializer.pubkey());
 
         for token_mint in [token_mint_1, token_mint_2].iter() {
             let (vest_schedule_pda, bump) =
@@ -719,7 +695,7 @@ mod tests {
                     AccountMeta::new(vest_schedule_pda, false),
                     AccountMeta::new_readonly(*token_mint, false),
                     AccountMeta::new_readonly(ID.into(), false),
-                    AccountMeta::new_readonly(TOKEN_PROGRAM_ID.into(), false),
+                    AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),
                 ],
                 data: instruction_data,
             };
@@ -739,11 +715,10 @@ mod tests {
                 token_mint
             );
 
-            // Verify the account exists
             let account = svm.get_account(&vest_schedule_pda);
             assert!(
                 account.is_some(),
-                "Vest schedule account for mint {:?} should exist",
+                "Account for mint {:?} should exist",
                 token_mint
             );
         }

@@ -20,7 +20,6 @@ mod tests {
         0x11, 0xf7,
     ]);
 
-    // Helper to create instruction data for AddParticipant
     fn create_add_participant_instruction_data(
         allocated_amount: u64,
         participant_bump: u8,
@@ -31,7 +30,6 @@ mod tests {
         data
     }
 
-    // Helper to derive participant PDA
     fn derive_participant_pda(participant: &Pubkey, schedule: &Pubkey) -> (Pubkey, u8) {
         Pubkey::find_program_address(
             &[b"vest_participant", participant.as_ref(), schedule.as_ref()],
@@ -39,7 +37,6 @@ mod tests {
         )
     }
 
-    // Helper to derive vest schedule PDA
     fn derive_vest_schedule_pda(
         seed: u64,
         token_mint: &Pubkey,
@@ -56,7 +53,6 @@ mod tests {
         )
     }
 
-    // Helper to derive ATA
     fn derive_ata(owner: &Pubkey, mint: &Pubkey) -> (Pubkey, u8) {
         Pubkey::find_program_address(
             &[owner.as_ref(), &TOKEN_PROGRAM_ID.to_bytes(), mint.as_ref()],
@@ -120,27 +116,32 @@ mod tests {
         mint_pubkey
     }
 
+    // Updated helper: removed status parameter, added start_timestamp
     fn create_vest_schedule(
         svm: &mut LiteSVM,
         authority: &Pubkey,
         token_mint: &Pubkey,
         seed: u64,
-        status: u8,
+        start_timestamp: u64,
+        cliff_duration: u64,
+        total_duration: u64,
+        step_duration: u64,
     ) -> Pubkey {
         let (schedule_pda, bump) = derive_vest_schedule_pda(seed, token_mint, authority);
 
+        // VestSchedule without status field: 105 bytes
         let mut schedule_data = Vec::new();
-        schedule_data.push(status); // Status: u8
-        schedule_data.extend_from_slice(token_mint.as_ref()); // Token mint: Pubkey
-        schedule_data.extend_from_slice(authority.as_ref()); // Authority: Pubkey
-        schedule_data.extend_from_slice(&seed.to_le_bytes()); // Seed: u64
-        schedule_data.extend_from_slice(&1000000000u64.to_le_bytes()); // Start timestamp: u64
-        schedule_data.extend_from_slice(&86400u64.to_le_bytes()); // Cliff duration: u64
-        schedule_data.extend_from_slice(&864000u64.to_le_bytes()); // Total duration: u64
-        schedule_data.extend_from_slice(&86400u64.to_le_bytes()); // Step duration: u64
-        schedule_data.push(bump); // Bump: u8
+        // No status field anymore
+        schedule_data.extend_from_slice(token_mint.as_ref()); // Token mint: Pubkey (32)
+        schedule_data.extend_from_slice(authority.as_ref()); // Authority: Pubkey (32)
+        schedule_data.extend_from_slice(&seed.to_le_bytes()); // Seed: u64 (8)
+        schedule_data.extend_from_slice(&start_timestamp.to_le_bytes()); // Start timestamp: u64 (8)
+        schedule_data.extend_from_slice(&cliff_duration.to_le_bytes()); // Cliff duration: u64 (8)
+        schedule_data.extend_from_slice(&total_duration.to_le_bytes()); // Total duration: u64 (8)
+        schedule_data.extend_from_slice(&step_duration.to_le_bytes()); // Step duration: u64 (8)
+        schedule_data.push(bump); // Bump: u8 (1)
 
-        assert_eq!(schedule_data.len(), 106);
+        assert_eq!(schedule_data.len(), 105);
 
         let schedule_account = Account {
             lamports: 10_000_000,
@@ -162,7 +163,6 @@ mod tests {
     ) -> Pubkey {
         let (ata, _) = derive_ata(owner, mint);
 
-        // Create proper SPL Token Account using Pack
         let token_account = TokenAccount {
             mint: *mint,
             owner: *owner,
@@ -201,17 +201,33 @@ mod tests {
         let token_mint = create_mock_token_mint(&mut svm, &authority.pubkey());
         let seed = 12345u64;
 
-        // Create a vest schedule in NotStarted status (0)
-        let schedule = create_vest_schedule(&mut svm, &authority.pubkey(), &token_mint, seed, 0);
+        let current_time = svm
+            .get_sysvar::<solana_sdk::clock::Clock>()
+            .unix_timestamp as u64;
 
-        // Create authority's ATA with balance
+        // Create schedule that starts in the future and hasn't reached cliff yet
+        let start_timestamp = current_time + 3600; // Starts in 1 hour
+        let cliff_duration = 86400; // 1 day cliff
+        let total_duration = 864000; // 10 days total
+        let step_duration = 86400; // 1 day steps
+
+        let schedule = create_vest_schedule(
+            &mut svm,
+            &authority.pubkey(),
+            &token_mint,
+            seed,
+            start_timestamp,
+            cliff_duration,
+            total_duration,
+            step_duration,
+        );
+
         let authority_ata =
             create_ata_with_balance(&mut svm, &authority.pubkey(), &token_mint, 1_000_000);
 
         let (participant_state, participant_bump) =
             derive_participant_pda(&participant.pubkey(), &schedule);
 
-        // Pre-create the vault ATA (required since init_if_needed was removed)
         let vault = create_ata_with_balance(&mut svm, &participant_state, &token_mint, 0);
 
         let allocated_amount = 100_000u64;
@@ -284,7 +300,20 @@ mod tests {
         let token_mint = create_mock_token_mint(&mut svm, &authority.pubkey());
         let seed = 12345u64;
 
-        let schedule = create_vest_schedule(&mut svm, &authority.pubkey(), &token_mint, seed, 0);
+        let current_time = svm
+            .get_sysvar::<solana_sdk::clock::Clock>()
+            .unix_timestamp as u64;
+
+        let schedule = create_vest_schedule(
+            &mut svm,
+            &authority.pubkey(),
+            &token_mint,
+            seed,
+            current_time + 3600,
+            86400,
+            864000,
+            86400,
+        );
 
         // Create authority's ATA with insufficient balance
         let authority_ata = create_ata_with_balance(
@@ -299,7 +328,7 @@ mod tests {
 
         let vault = create_ata_with_balance(&mut svm, &participant_state, &token_mint, 0);
 
-        let allocated_amount = 100_000u64; // Trying to allocate 100k (more than available)
+        let allocated_amount = 100_000u64; // Trying to allocate 100k
         let instruction_data =
             create_add_participant_instruction_data(allocated_amount, participant_bump);
 
@@ -349,8 +378,21 @@ mod tests {
         let token_mint = create_mock_token_mint(&mut svm, &authority.pubkey());
         let seed = 12345u64;
 
+        let current_time = svm
+            .get_sysvar::<solana_sdk::clock::Clock>()
+            .unix_timestamp as u64;
+
         // Schedule created with `authority`
-        let schedule = create_vest_schedule(&mut svm, &authority.pubkey(), &token_mint, seed, 0);
+        let schedule = create_vest_schedule(
+            &mut svm,
+            &authority.pubkey(),
+            &token_mint,
+            seed,
+            current_time + 3600,
+            86400,
+            864000,
+            86400,
+        );
 
         // But we use wrong_authority's ATA
         let wrong_authority_ata =
@@ -368,7 +410,7 @@ mod tests {
         let instruction = Instruction {
             program_id: PROGRAM_ID,
             accounts: vec![
-                AccountMeta::new(wrong_authority.pubkey(), true), // Wrong authority!
+                AccountMeta::new(wrong_authority.pubkey(), true),
                 AccountMeta::new(wrong_authority_ata, false),
                 AccountMeta::new(vault, false),
                 AccountMeta::new_readonly(participant.pubkey(), false),
@@ -397,70 +439,6 @@ mod tests {
     }
 
     #[test]
-    fn test_add_participant_invalid_schedule_status() {
-        let mut svm = setup_svm();
-
-        let authority = Keypair::new();
-        let participant = Keypair::new();
-
-        svm.airdrop(&authority.pubkey(), 10_000_000_000).unwrap();
-
-        let token_mint = create_mock_token_mint(&mut svm, &authority.pubkey());
-        let seed = 12345u64;
-
-        // Create schedule in Vesting status (2) - not allowed for adding participants
-        let schedule = create_vest_schedule(
-            &mut svm,
-            &authority.pubkey(),
-            &token_mint,
-            seed,
-            2, // Vesting status
-        );
-
-        let authority_ata =
-            create_ata_with_balance(&mut svm, &authority.pubkey(), &token_mint, 1_000_000);
-
-        let (participant_state, participant_bump) =
-            derive_participant_pda(&participant.pubkey(), &schedule);
-
-        let vault = create_ata_with_balance(&mut svm, &participant_state, &token_mint, 0);
-
-        let allocated_amount = 100_000u64;
-        let instruction_data =
-            create_add_participant_instruction_data(allocated_amount, participant_bump);
-
-        let instruction = Instruction {
-            program_id: PROGRAM_ID,
-            accounts: vec![
-                AccountMeta::new(authority.pubkey(), true),
-                AccountMeta::new(authority_ata, false),
-                AccountMeta::new(vault, false),
-                AccountMeta::new_readonly(participant.pubkey(), false),
-                AccountMeta::new(participant_state, false),
-                AccountMeta::new(schedule, false),
-                AccountMeta::new_readonly(token_mint, false),
-                AccountMeta::new_readonly(ID.into(), false),
-                AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),
-            ],
-            data: instruction_data,
-        };
-
-        let transaction = Transaction::new_signed_with_payer(
-            &[instruction],
-            Some(&authority.pubkey()),
-            &[&authority],
-            svm.latest_blockhash(),
-        );
-
-        let result = svm.send_transaction(transaction);
-        print_transaction_logs(&result);
-        assert!(
-            result.is_err(),
-            "Transaction should fail with invalid schedule status"
-        );
-    }
-
-    #[test]
     fn test_add_participant_zero_allocation() {
         let mut svm = setup_svm();
 
@@ -472,7 +450,20 @@ mod tests {
         let token_mint = create_mock_token_mint(&mut svm, &authority.pubkey());
         let seed = 12345u64;
 
-        let schedule = create_vest_schedule(&mut svm, &authority.pubkey(), &token_mint, seed, 0);
+        let current_time = svm
+            .get_sysvar::<solana_sdk::clock::Clock>()
+            .unix_timestamp as u64;
+
+        let schedule = create_vest_schedule(
+            &mut svm,
+            &authority.pubkey(),
+            &token_mint,
+            seed,
+            current_time + 3600,
+            86400,
+            864000,
+            86400,
+        );
 
         let authority_ata =
             create_ata_with_balance(&mut svm, &authority.pubkey(), &token_mint, 1_000_000);
@@ -530,8 +521,21 @@ mod tests {
         let wrong_token_mint = create_mock_token_mint(&mut svm, &authority.pubkey());
         let seed = 12345u64;
 
+        let current_time = svm
+            .get_sysvar::<solana_sdk::clock::Clock>()
+            .unix_timestamp as u64;
+
         // Schedule created with token_mint
-        let schedule = create_vest_schedule(&mut svm, &authority.pubkey(), &token_mint, seed, 0);
+        let schedule = create_vest_schedule(
+            &mut svm,
+            &authority.pubkey(),
+            &token_mint,
+            seed,
+            current_time + 3600,
+            86400,
+            864000,
+            86400,
+        );
 
         // But we use wrong_token_mint for ATA
         let authority_ata =
@@ -555,7 +559,7 @@ mod tests {
                 AccountMeta::new_readonly(participant.pubkey(), false),
                 AccountMeta::new(participant_state, false),
                 AccountMeta::new(schedule, false),
-                AccountMeta::new_readonly(wrong_token_mint, false), // Wrong mint!
+                AccountMeta::new_readonly(wrong_token_mint, false),
                 AccountMeta::new_readonly(ID.into(), false),
                 AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),
             ],
@@ -589,7 +593,20 @@ mod tests {
         let token_mint = create_mock_token_mint(&mut svm, &authority.pubkey());
         let seed = 12345u64;
 
-        let schedule = create_vest_schedule(&mut svm, &authority.pubkey(), &token_mint, seed, 0);
+        let current_time = svm
+            .get_sysvar::<solana_sdk::clock::Clock>()
+            .unix_timestamp as u64;
+
+        let schedule = create_vest_schedule(
+            &mut svm,
+            &authority.pubkey(),
+            &token_mint,
+            seed,
+            current_time + 3600,
+            86400,
+            864000,
+            86400,
+        );
 
         let authority_ata =
             create_ata_with_balance(&mut svm, &authority.pubkey(), &token_mint, 1_000_000);
@@ -632,6 +649,89 @@ mod tests {
         assert!(
             result.is_err(),
             "Transaction should fail when vault is not pre-created"
+        );
+    }
+
+    #[test]
+    fn test_add_participant_double_initialization() {
+        let mut svm = setup_svm();
+
+        let authority = Keypair::new();
+        let participant = Keypair::new();
+
+        svm.airdrop(&authority.pubkey(), 10_000_000_000).unwrap();
+
+        let token_mint = create_mock_token_mint(&mut svm, &authority.pubkey());
+        let seed = 12345u64;
+
+        let current_time = svm
+            .get_sysvar::<solana_sdk::clock::Clock>()
+            .unix_timestamp as u64;
+
+        let schedule = create_vest_schedule(
+            &mut svm,
+            &authority.pubkey(),
+            &token_mint,
+            seed,
+            current_time + 3600,
+            86400,
+            864000,
+            86400,
+        );
+
+        let authority_ata =
+            create_ata_with_balance(&mut svm, &authority.pubkey(), &token_mint, 1_000_000);
+
+        let (participant_state, participant_bump) =
+            derive_participant_pda(&participant.pubkey(), &schedule);
+
+        let vault = create_ata_with_balance(&mut svm, &participant_state, &token_mint, 0);
+
+        let allocated_amount = 100_000u64;
+        let instruction_data =
+            create_add_participant_instruction_data(allocated_amount, participant_bump);
+
+        let instruction = Instruction {
+            program_id: PROGRAM_ID,
+            accounts: vec![
+                AccountMeta::new(authority.pubkey(), true),
+                AccountMeta::new(authority_ata, false),
+                AccountMeta::new(vault, false),
+                AccountMeta::new_readonly(participant.pubkey(), false),
+                AccountMeta::new(participant_state, false),
+                AccountMeta::new(schedule, false),
+                AccountMeta::new_readonly(token_mint, false),
+                AccountMeta::new_readonly(ID.into(), false),
+                AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),
+            ],
+            data: instruction_data.clone(),
+        };
+
+        // First transaction should succeed
+        let transaction = Transaction::new_signed_with_payer(
+            &[instruction.clone()],
+            Some(&authority.pubkey()),
+            &[&authority],
+            svm.latest_blockhash(),
+        );
+
+        let result = svm.send_transaction(transaction);
+        print_transaction_logs(&result);
+        assert!(result.is_ok(), "First transaction should succeed");
+
+        // Second transaction with same participant should fail
+        let transaction2 = Transaction::new_signed_with_payer(
+            &[instruction],
+            Some(&authority.pubkey()),
+            &[&authority],
+            svm.latest_blockhash(),
+        );
+
+        let result2 = svm.send_transaction(transaction2);
+        print_transaction_logs(&result2);
+        assert!(
+            result2.is_err(),
+            "Should prevent double initialization of same participant"
         );
     }
 }

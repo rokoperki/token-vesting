@@ -4,11 +4,10 @@ use pinocchio::{
     program_error::ProgramError,
     sysvars::{clock::Clock, Sysvar},
 };
-use pinocchio_token::instructions::Transfer;
+use pinocchio_token::{instructions::Transfer, state::TokenAccount};
 
 use crate::{
     AssociatedToken, PinocchioError, ProgramAccount, SignerAccount, VestParticipant, VestSchedule,
-    VestStatus,
 };
 
 pub struct ClaimAccounts<'a> {
@@ -16,7 +15,6 @@ pub struct ClaimAccounts<'a> {
     pub participant_state: &'a AccountInfo,
     pub participant_ata: &'a AccountInfo,
     pub vest_schedule: &'a AccountInfo,
-    pub authority: &'a AccountInfo,
     pub vault: &'a AccountInfo,
     pub token_program: &'a AccountInfo,
 }
@@ -25,7 +23,7 @@ impl<'a> TryFrom<&'a [AccountInfo]> for ClaimAccounts<'a> {
     type Error = ProgramError;
 
     fn try_from(accounts: &'a [AccountInfo]) -> Result<Self, Self::Error> {
-        let [participant, participant_state, participant_ata, vest_schedule, authority, vault, token_program] =
+        let [participant, participant_state, participant_ata, vest_schedule, vault, token_program] =
             accounts
         else {
             return Err(ProgramError::NotEnoughAccountKeys);
@@ -41,7 +39,6 @@ impl<'a> TryFrom<&'a [AccountInfo]> for ClaimAccounts<'a> {
             participant_state,
             participant_ata,
             vest_schedule,
-            authority,
             vault,
             token_program,
         })
@@ -58,44 +55,47 @@ impl<'a> TryFrom<&'a [AccountInfo]> for Claim<'a> {
     fn try_from(accounts: &'a [AccountInfo]) -> Result<Self, Self::Error> {
         let accounts = ClaimAccounts::try_from(accounts)?;
 
-        let mut vest_schedule_data = accounts.vest_schedule.try_borrow_mut_data()?;
-        let vest_schedule = VestSchedule::load_mut(&mut vest_schedule_data)?;
+        {
+            let vest_schedule_data = accounts.vest_schedule.try_borrow_data()?;
+            let vest_schedule = VestSchedule::load(&vest_schedule_data)?;
 
-        let mut participant_state_data = accounts.participant_state.try_borrow_mut_data()?;
-        let participant_state = VestParticipant::load_mut(&mut participant_state_data)?;
+            let participant_state_data = accounts.participant_state.try_borrow_data()?;
+            let participant_state = VestParticipant::load(&participant_state_data)?;
 
-        AssociatedToken::check(
-            accounts.vault,
-            *accounts.participant_state.key(),
-            *vest_schedule.token_mint(),
-            *accounts.token_program.key(),
-        )?;
+            AssociatedToken::check(
+                accounts.vault,
+                *accounts.participant_state.key(),
+                *vest_schedule.token_mint(),
+                *accounts.token_program.key(),
+            )?;
 
-        AssociatedToken::check(
-            accounts.participant_ata,
-            *accounts.participant.key(),
-            *vest_schedule.token_mint(),
-            *accounts.token_program.key(),
-        )?;
+            AssociatedToken::check(
+                accounts.participant_ata,
+                *accounts.participant.key(),
+                *vest_schedule.token_mint(),
+                *accounts.token_program.key(),
+            )?;
 
-        match vest_schedule.status() {
-            x if x == VestStatus::Stepping as u8 || x == VestStatus::Completed as u8 => {}
-            _ => return Err(ProgramError::InvalidAccountData),
+            ProgramAccount::verify(
+                &[
+                    Seed::from(b"vest_participant"),
+                    Seed::from(accounts.participant.key().as_ref()),
+                    Seed::from(accounts.vest_schedule.key().as_ref()),
+                ],
+                accounts.participant_state,
+                participant_state.bump(),
+            )?;
+
+            if participant_state.participant() != accounts.participant.key() {
+                return Err(ProgramError::IllegalOwner);
+            }
+
+            if participant_state.schedule() != accounts.vest_schedule.key() {
+                return Err(ProgramError::InvalidAccountData);
+            }
         }
 
-        if accounts.authority.key() != vest_schedule.authority() {
-            return Err(ProgramError::IllegalOwner);
-        }
-
-        if participant_state.participant() != accounts.participant.key() {
-            return Err(ProgramError::IllegalOwner);
-        }
-
-        if participant_state.schedule() != accounts.vest_schedule.key() {
-            return Err(ProgramError::IllegalOwner);
-        }
-
-        Ok(Self { accounts: accounts })
+        Ok(Self { accounts })
     }
 }
 
@@ -120,7 +120,12 @@ impl<'a> Claim<'a> {
             return Err(PinocchioError::NoClaimableAmount.into());
         }
 
-        let binding = vest_schedule.bump().to_le_bytes();
+        let vault_account = TokenAccount::from_account_info(self.accounts.vault)?;
+        if vault_account.amount() < claimable_amount {
+            return Err(ProgramError::InsufficientFunds);
+        }
+
+        let binding = participant_state.bump().to_le_bytes();
         let participant_seeds = [
             Seed::from(b"vest_participant"),
             Seed::from(self.accounts.participant.key().as_ref()),
@@ -138,11 +143,15 @@ impl<'a> Claim<'a> {
         }
         .invoke_signed(&signer)?;
 
-        participant_state.set_claimed_amount(
-            participant_state
-                .claimed_amount()
-                .saturating_add(claimable_amount),
-        );
+        let new_claimed = participant_state
+            .claimed_amount()
+            .saturating_add(claimable_amount);
+
+        if new_claimed > participant_state.allocated_amount() {
+            return Err(PinocchioError::ClaimExceedsAllocation.into());
+        }
+
+        participant_state.set_claimed_amount(new_claimed);
 
         Ok(())
     }

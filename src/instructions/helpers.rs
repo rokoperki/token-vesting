@@ -93,14 +93,13 @@ impl ProgramAccount {
         seeds: &[Seed<'a>],
         space: usize,
     ) -> ProgramResult {
-        let lamports = Rent::get()?.minimum_balance(space);
-
-        let signer = [Signer::from(seeds)];
-
         if account.lamports() > 0 {
             return Err(ProgramError::AccountAlreadyInitialized);
         }
-
+    
+        let lamports = Rent::get()?.minimum_balance(space);
+        let signer = [Signer::from(seeds)];
+    
         CreateAccount {
             from: payer,
             to: account,
@@ -109,9 +108,10 @@ impl ProgramAccount {
             owner: &crate::ID,
         }
         .invoke_signed(&signer)?;
-
+    
         Ok(())
     }
+
 }
 
 pub struct Mint;

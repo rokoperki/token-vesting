@@ -20,6 +20,10 @@ pub enum PinocchioError {
     InvalidDurations,
     #[error("Step duration must divide total duration evenly")]
     InvalidStepDuration,
+    #[error("Cannot add participants after cliff period has ended")]
+    CannotAddParticipantsAfterCliff,
+    #[error("Claim exceeds allocated amount")]
+    ClaimExceedsAllocation,
 }
 
 impl From<PinocchioError> for ProgramError {

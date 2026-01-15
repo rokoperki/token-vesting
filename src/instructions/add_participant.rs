@@ -1,11 +1,14 @@
 use pinocchio::{
-    account_info::AccountInfo, instruction::Seed, program_error::ProgramError,
+    account_info::AccountInfo,
+    instruction::Seed,
+    program_error::ProgramError,
+    sysvars::{clock::Clock, Sysvar},
 };
 use pinocchio_token::{instructions::Transfer, state::TokenAccount};
 
 use crate::{
-    participant_state, AssociatedToken, Mint, ProgramAccount, SignerAccount, VestParticipant,
-    VestSchedule, VestStatus,
+    participant_state, AssociatedToken, Mint, PinocchioError, ProgramAccount, SignerAccount,
+    VestParticipant, VestSchedule,
 };
 
 pub struct AddParticipantAccounts<'a> {
@@ -93,10 +96,10 @@ impl<'a> TryFrom<(&[u8], &'a [AccountInfo])> for AddParticipant<'a> {
         let vest_schedule_data = accounts.schedule.try_borrow_data()?;
         let vest_schedule = VestSchedule::load(&vest_schedule_data)?;
 
-        if vest_schedule.status() != VestStatus::NotStarted as u8
-            && vest_schedule.status() != VestStatus::Cliff as u8
-        {
-            return Err(ProgramError::InvalidAccountData);
+        let current_timestamp = Clock::get()?.unix_timestamp as u64;
+
+        if vest_schedule.is_cliff_completed(current_timestamp) {
+            return Err(PinocchioError::CannotAddParticipantsAfterCliff.into());
         }
 
         if accounts.authority.key() != vest_schedule.authority() {
