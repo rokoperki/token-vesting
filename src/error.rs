@@ -26,6 +26,8 @@ pub enum PinocchioError {
     ClaimExceedsAllocation,
     #[error("Nonexistent seed value")]
     InvalidSeed,
+    #[error("Invalid state discriminator")]
+    InvalidDiscriminator,
 }
 
 impl From<PinocchioError> for ProgramError {

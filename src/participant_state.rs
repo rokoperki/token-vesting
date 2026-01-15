@@ -2,6 +2,7 @@ use pinocchio::pubkey::Pubkey;
 
 #[repr(C, packed)]
 pub struct VestParticipant {
+    pub discriminator: u8,
     pub participant: Pubkey,
     pub schedule: Pubkey,
     pub allocated_amount: u64,
@@ -9,8 +10,18 @@ pub struct VestParticipant {
     pub bump: u8,
 }
 
+use crate::Discriminator;
+
+impl Discriminator for VestParticipant {
+    const LEN: usize = Self::LEN;
+    const DISCRIMINATOR: u8 = Self::DISCRIMINATOR;
+}
+
 impl VestParticipant {
-    pub const LEN: usize = std::mem::size_of::<Pubkey>() * 2 + std::mem::size_of::<u64>() * 2 + std::mem::size_of::<u8>();
+    pub const LEN: usize = std::mem::size_of::<Pubkey>() * 2
+        + std::mem::size_of::<u64>() * 2
+        + std::mem::size_of::<u8>() * 2;
+    pub const DISCRIMINATOR: u8 = 1;
 
     #[inline(always)]
     pub fn load_mut(bytes: &mut [u8]) -> Result<&mut Self, pinocchio::program_error::ProgramError> {
@@ -65,6 +76,7 @@ impl VestParticipant {
         claimed_amount: u64,
         bump: u8,
     ) {
+        self.discriminator = VestParticipant::DISCRIMINATOR;
         self.participant = participant;
         self.schedule = schedule;
         self.allocated_amount = allocated_amount;

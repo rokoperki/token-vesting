@@ -36,7 +36,7 @@ impl<'a> TryFrom<&'a [AccountInfo]> for AddParticipantAccounts<'a> {
         SignerAccount::check(authority)?;
         ProgramAccount::check_system_program(system_program)?;
         ProgramAccount::check_token_program(token_program)?;
-        ProgramAccount::check_schedule(schedule)?;
+        ProgramAccount::check::<VestSchedule>(schedule)?;
         Mint::check(token_mint)?;
 
         Ok(Self {
@@ -134,7 +134,7 @@ impl<'a> TryFrom<(&[u8], &'a [AccountInfo])> for AddParticipant<'a> {
 
         AssociatedToken::check(
             accounts.vault,
-            *accounts.participant_state.key(),
+            *accounts.schedule.key(),
             *accounts.token_mint.key(),
             *accounts.token_program.key(),
         )?;

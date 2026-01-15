@@ -1,27 +1,25 @@
 use pinocchio::{
-    account_info::AccountInfo,
-    instruction::Seed,
-    program_error::ProgramError,
-    sysvars::{clock::Clock, Sysvar},
-    ProgramResult,
+    ProgramResult, account_info::AccountInfo, instruction::Seed, program_error::ProgramError, sysvars::{Sysvar, clock::Clock}
 };
 
-use crate::{Mint, PinocchioError, ProgramAccount, SignerAccount, VestSchedule};
+use crate::{AssociatedToken, Mint, PinocchioError, ProgramAccount, SignerAccount, VestSchedule};
 
 pub struct InitializeAccounts<'a> {
     pub initializer: &'a AccountInfo,
     pub vest_schedule: &'a AccountInfo,
     pub token_mint: &'a AccountInfo,
-    // ode bi jos dodao vault accoung odnosno schedule atu i inicijalizirao u ovoj instrukciji tu ATAu
+    pub vault: &'a AccountInfo,
     pub system_program: &'a AccountInfo,
     pub token_program: &'a AccountInfo,
+    pub ata_program: &'a AccountInfo,
 }
 
 impl<'a> TryFrom<&'a [AccountInfo]> for InitializeAccounts<'a> {
     type Error = ProgramError;
 
     fn try_from(accounts: &'a [AccountInfo]) -> Result<Self, Self::Error> {
-        let [initializer, vest_schedule, token_mint, system_program, token_program] = accounts
+        let [initializer, vest_schedule, token_mint, vault, system_program, token_program, ata_program] =
+            accounts
         else {
             return Err(ProgramError::NotEnoughAccountKeys);
         };
@@ -29,14 +27,26 @@ impl<'a> TryFrom<&'a [AccountInfo]> for InitializeAccounts<'a> {
         SignerAccount::check(&initializer)?;
         ProgramAccount::check_system_program(system_program)?;
         ProgramAccount::check_token_program(token_program)?;
+        ProgramAccount::check_ata_program(ata_program)?;
         Mint::check(token_mint)?;
+        AssociatedToken::init_if_needed(
+            vault,
+            token_mint,
+            initializer,
+            vest_schedule,
+            system_program,
+            token_program,
+        )?;
+
 
         Ok(Self {
             initializer,
             vest_schedule,
             token_mint,
+            vault,
             system_program,
             token_program,
+            ata_program,
         })
     }
 }
@@ -115,12 +125,7 @@ impl<'a> TryFrom<(&[u8], &'a [AccountInfo])> for Initialize<'a> {
         let seed_binding = instruction_data.seed.to_le_bytes();
 
         ProgramAccount::verify(
-            &[
-                Seed::from(b"vest_schedule"),
-                Seed::from(&seed_binding),
-                Seed::from(accounts.token_mint.key().as_ref()),
-                Seed::from(accounts.initializer.key().as_ref()),
-            ],
+            &[Seed::from(b"vest_schedule"), Seed::from(&seed_binding)],
             accounts.vest_schedule,
             instruction_data.bump,
         )?;
@@ -141,16 +146,11 @@ impl<'a> Initialize<'a> {
         let vest_schedule_seed = [
             Seed::from(b"vest_schedule"),
             Seed::from(&seed_binding),
-            // nema bas razloga za koristit mint kao dio seeda
-            Seed::from(self.accounts.token_mint.key().as_ref()),
-            // nema bas razloga za koristit intiializera kao dio seeda
-            Seed::from(self.accounts.initializer.key().as_ref()),
             Seed::from(&binding),
         ];
 
         ProgramAccount::init::<VestSchedule>(
             self.accounts.initializer,
-            // dodati provjeru da account nije vec initializiran
             self.accounts.vest_schedule,
             &vest_schedule_seed,
             VestSchedule::LEN,
@@ -162,6 +162,7 @@ impl<'a> Initialize<'a> {
         vest_schedule.set_inner(
             *self.accounts.token_mint.key(),
             *self.accounts.initializer.key(),
+            *self.accounts.vault.key(),
             self.instruction_data.seed,
             self.instruction_data.start_timestamp,
             self.instruction_data.cliff_duration,

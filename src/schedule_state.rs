@@ -2,8 +2,10 @@ use pinocchio::{program_error::ProgramError, pubkey::Pubkey};
 
 #[repr(C, packed)]
 pub struct VestSchedule {
+    discriminator: u8,
     token_mint: Pubkey,
     authority: Pubkey,
+    vault: Pubkey,
     seed: u64,
     start_timestamp: u64,
     cliff_duration: u64,
@@ -12,16 +14,16 @@ pub struct VestSchedule {
     bump: u8,
 }
 
-#[repr(u8)]
-pub enum VestStatus {
-    NotStarted = 0u8,
-    Cliff = 1u8,
-    Stepping = 2u8,
-    Completed = 3u8,
+use crate::Discriminator;
+
+impl Discriminator for VestSchedule {
+    const LEN: usize = Self::LEN;
+    const DISCRIMINATOR: u8 = Self::DISCRIMINATOR;
 }
 
 impl VestSchedule {
-    pub const LEN: usize = size_of::<Pubkey>() * 2 + size_of::<u64>() * 5 + size_of::<u8>();
+    pub const LEN: usize = size_of::<Pubkey>() * 3 + size_of::<u64>() * 5 + size_of::<u8>() * 2;
+    pub const DISCRIMINATOR: u8 = 0;
 
     #[inline(always)]
     pub fn load_mut(bytes: &mut [u8]) -> Result<&mut Self, ProgramError> {
@@ -52,7 +54,6 @@ impl VestSchedule {
         }
 
         if current_timestamp >= self.start_timestamp + self.total_duration {
-            // vise volim koristit checked_sub jer nebi smilo nikad overflowat, pa ako se dogodi znaci da je neki problem i bolje da dobijemo error
             return total_allocated_amount.saturating_sub(claimed_amount);
         }
 
@@ -80,6 +81,11 @@ impl VestSchedule {
     #[inline(always)]
     pub fn authority(&self) -> &Pubkey {
         &self.authority
+    }
+
+    #[inline(always)]
+    pub fn vault(&self) -> &Pubkey {
+        &self.vault
     }
 
     #[inline(always)]
@@ -117,6 +123,7 @@ impl VestSchedule {
         &mut self,
         token_mint: Pubkey,
         authority: Pubkey,
+        vault: Pubkey,
         seed: u64,
         start_timestamp: u64,
         cliff_duration: u64,
@@ -124,8 +131,10 @@ impl VestSchedule {
         step_duration: u64,
         bump: u8,
     ) {
+        self.discriminator = VestSchedule::DISCRIMINATOR;
         self.token_mint = token_mint;
         self.authority = authority;
+        self.vault = vault;
         self.seed = seed;
         self.start_timestamp = start_timestamp;
         self.cliff_duration = cliff_duration;

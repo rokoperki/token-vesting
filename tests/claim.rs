@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod claim_tests {
     use litesvm::LiteSVM;
+    use pinocchio_system::ID;
     use solana_sdk::{
         account::Account,
         clock::Clock,
@@ -9,6 +10,7 @@ mod claim_tests {
         signature::{Keypair, Signer},
         transaction::Transaction,
     };
+    use spl_associated_token_account::ID as ATA_PROGRAM_ID;
     use spl_token::solana_program::program_option::COption;
     use spl_token::solana_program::program_pack::Pack;
     use spl_token::state::{Account as TokenAccount, AccountState, Mint};
@@ -22,10 +24,14 @@ mod claim_tests {
 
     // January 1, 2025 00:00:00 UTC
     const JAN_1_2025: i64 = 1735689600;
-    
     const ONE_DAY: u64 = 86_400;
 
     const CLAIM_DISCRIMINATOR: u8 = 2;
+
+    // VestSchedule::LEN = discriminator(1) + 3*Pubkey(96) + 5*u64(40) + bump(1) = 138
+    const VEST_SCHEDULE_LEN: usize = 138;
+    // VestParticipant::LEN = discriminator(1) + 2*Pubkey(64) + 2*u64(16) + bump(1) = 82
+    const VEST_PARTICIPANT_LEN: usize = 82;
 
     fn create_claim_instruction_data() -> Vec<u8> {
         vec![CLAIM_DISCRIMINATOR]
@@ -38,37 +44,22 @@ mod claim_tests {
         )
     }
 
-    fn derive_vest_schedule_pda(
-        seed: u64,
-        token_mint: &Pubkey,
-        initializer: &Pubkey,
-    ) -> (Pubkey, u8) {
-        Pubkey::find_program_address(
-            &[
-                b"vest_schedule",
-                &seed.to_le_bytes(),
-                token_mint.as_ref(),
-                initializer.as_ref(),
-            ],
-            &PROGRAM_ID,
-        )
+    // Updated: PDA now uses only seed
+    fn derive_vest_schedule_pda(seed: u64) -> (Pubkey, u8) {
+        Pubkey::find_program_address(&[b"vest_schedule", &seed.to_le_bytes()], &PROGRAM_ID)
     }
 
-    fn derive_ata(owner: &Pubkey, mint: &Pubkey) -> (Pubkey, u8) {
-        Pubkey::find_program_address(
-            &[owner.as_ref(), &TOKEN_PROGRAM_ID.to_bytes(), mint.as_ref()],
-            &Pubkey::new_from_array(pinocchio_associated_token_account::ID),
-        )
+    fn derive_ata(owner: &Pubkey, mint: &Pubkey) -> Pubkey {
+        spl_associated_token_account::get_associated_token_address(owner, mint)
     }
 
     fn setup_svm() -> LiteSVM {
         let mut svm = LiteSVM::new().with_builtins().with_sigverify(false);
         svm.add_program_from_file(PROGRAM_ID, "target/deploy/token_vesting.so")
             .expect("Failed to load program");
-        
-        // Set clock to January 1, 2025
+
         warp_to_timestamp(&mut svm, JAN_1_2025);
-        
+
         svm
     }
 
@@ -118,17 +109,22 @@ mod claim_tests {
         let mut data = vec![0u8; Mint::LEN];
         Mint::pack(mint_data, &mut data).unwrap();
 
-        svm.set_account(mint_pubkey, Account {
-            lamports: 10_000_000,
-            data,
-            owner: TOKEN_PROGRAM_ID,
-            executable: false,
-            rent_epoch: 0,
-        }.into());
-        
+        svm.set_account(
+            mint_pubkey,
+            Account {
+                lamports: 10_000_000,
+                data,
+                owner: TOKEN_PROGRAM_ID,
+                executable: false,
+                rent_epoch: 0,
+            }
+            .into(),
+        );
+
         mint_pubkey
     }
 
+    // Updated: VestSchedule now has discriminator and vault field (138 bytes)
     fn create_vest_schedule(
         svm: &mut LiteSVM,
         authority: &Pubkey,
@@ -139,29 +135,39 @@ mod claim_tests {
         total_duration: u64,
         step_duration: u64,
     ) -> Pubkey {
-        let (schedule_pda, bump) = derive_vest_schedule_pda(seed, token_mint, authority);
+        let (schedule_pda, bump) = derive_vest_schedule_pda(seed);
+        let vault = derive_ata(&schedule_pda, token_mint);
 
-        let mut schedule_data = Vec::with_capacity(105);
-        schedule_data.extend_from_slice(token_mint.as_ref());
-        schedule_data.extend_from_slice(authority.as_ref());
-        schedule_data.extend_from_slice(&seed.to_le_bytes());
-        schedule_data.extend_from_slice(&start_timestamp.to_le_bytes());
-        schedule_data.extend_from_slice(&cliff_duration.to_le_bytes());
-        schedule_data.extend_from_slice(&total_duration.to_le_bytes());
-        schedule_data.extend_from_slice(&step_duration.to_le_bytes());
-        schedule_data.push(bump);
+        let mut schedule_data = Vec::with_capacity(VEST_SCHEDULE_LEN);
+        schedule_data.push(0u8); // Discriminator
+        schedule_data.extend_from_slice(token_mint.as_ref()); // Token mint: Pubkey (32)
+        schedule_data.extend_from_slice(authority.as_ref()); // Authority: Pubkey (32)
+        schedule_data.extend_from_slice(vault.as_ref()); // Vault: Pubkey (32)
+        schedule_data.extend_from_slice(&seed.to_le_bytes()); // Seed: u64 (8)
+        schedule_data.extend_from_slice(&start_timestamp.to_le_bytes()); // Start timestamp: u64 (8)
+        schedule_data.extend_from_slice(&cliff_duration.to_le_bytes()); // Cliff duration: u64 (8)
+        schedule_data.extend_from_slice(&total_duration.to_le_bytes()); // Total duration: u64 (8)
+        schedule_data.extend_from_slice(&step_duration.to_le_bytes()); // Step duration: u64 (8)
+        schedule_data.push(bump); // Bump: u8 (1)
 
-        svm.set_account(schedule_pda, Account {
-            lamports: 10_000_000,
-            data: schedule_data,
-            owner: PROGRAM_ID,
-            executable: false,
-            rent_epoch: 0,
-        }.into());
-        
+        assert_eq!(schedule_data.len(), VEST_SCHEDULE_LEN);
+
+        svm.set_account(
+            schedule_pda,
+            Account {
+                lamports: 10_000_000,
+                data: schedule_data,
+                owner: PROGRAM_ID,
+                executable: false,
+                rent_epoch: 0,
+            }
+            .into(),
+        );
+
         schedule_pda
     }
 
+    // Updated: VestParticipant now has discriminator (82 bytes)
     fn create_participant_state(
         svm: &mut LiteSVM,
         participant: &Pubkey,
@@ -171,21 +177,28 @@ mod claim_tests {
     ) -> Pubkey {
         let (participant_state, bump) = derive_participant_pda(participant, schedule);
 
-        let mut data = Vec::with_capacity(81);
-        data.extend_from_slice(participant.as_ref());
-        data.extend_from_slice(schedule.as_ref());
-        data.extend_from_slice(&allocated_amount.to_le_bytes());
-        data.extend_from_slice(&claimed_amount.to_le_bytes());
-        data.push(bump);
+        let mut data = Vec::with_capacity(VEST_PARTICIPANT_LEN);
+        data.push(1u8); // Discriminator
+        data.extend_from_slice(participant.as_ref()); // Participant: Pubkey (32)
+        data.extend_from_slice(schedule.as_ref()); // Schedule: Pubkey (32)
+        data.extend_from_slice(&allocated_amount.to_le_bytes()); // Allocated: u64 (8)
+        data.extend_from_slice(&claimed_amount.to_le_bytes()); // Claimed: u64 (8)
+        data.push(bump); // Bump: u8 (1)
 
-        svm.set_account(participant_state, Account {
-            lamports: 10_000_000,
-            data,
-            owner: PROGRAM_ID,
-            executable: false,
-            rent_epoch: 0,
-        }.into());
-        
+        assert_eq!(data.len(), VEST_PARTICIPANT_LEN);
+
+        svm.set_account(
+            participant_state,
+            Account {
+                lamports: 10_000_000,
+                data,
+                owner: PROGRAM_ID,
+                executable: false,
+                rent_epoch: 0,
+            }
+            .into(),
+        );
+
         participant_state
     }
 
@@ -195,7 +208,7 @@ mod claim_tests {
         mint: &Pubkey,
         amount: u64,
     ) -> Pubkey {
-        let (ata, _) = derive_ata(owner, mint);
+        let ata = derive_ata(owner, mint);
 
         let token_account = TokenAccount {
             mint: *mint,
@@ -211,23 +224,29 @@ mod claim_tests {
         let mut data = vec![0u8; TokenAccount::LEN];
         TokenAccount::pack(token_account, &mut data).unwrap();
 
-        svm.set_account(ata, Account {
-            lamports: 10_000_000,
-            data,
-            owner: TOKEN_PROGRAM_ID,
-            executable: false,
-            rent_epoch: 0,
-        }.into());
-        
+        svm.set_account(
+            ata,
+            Account {
+                lamports: 10_000_000,
+                data,
+                owner: TOKEN_PROGRAM_ID,
+                executable: false,
+                rent_epoch: 0,
+            }
+            .into(),
+        );
+
         ata
     }
 
+    // Updated: 9 accounts now
     fn build_claim_instruction(
         participant: &Pubkey,
         participant_state: &Pubkey,
         participant_ata: &Pubkey,
         vest_schedule: &Pubkey,
         vault: &Pubkey,
+        token_mint: &Pubkey,
     ) -> Instruction {
         Instruction {
             program_id: PROGRAM_ID,
@@ -235,17 +254,153 @@ mod claim_tests {
                 AccountMeta::new(*participant, true),
                 AccountMeta::new(*participant_state, false),
                 AccountMeta::new(*participant_ata, false),
-                AccountMeta::new(*vest_schedule, false), // Must be mutable - program borrows mutably
+                AccountMeta::new(*vest_schedule, false),
                 AccountMeta::new(*vault, false),
+                AccountMeta::new_readonly(*token_mint, false),
+                AccountMeta::new_readonly(ID.into(), false),
                 AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),
+                AccountMeta::new_readonly(ATA_PROGRAM_ID, false),
             ],
             data: create_claim_instruction_data(),
         }
     }
 
-    // ==================== CRITICAL EDGE CASES ====================
+    // ==================== SUCCESS CASES ====================
 
-    /// Claim at first claimable moment (cliff end + 1 step)
+    #[test]
+    fn test_claim_success_fully_vested() {
+        let mut svm = setup_svm();
+
+        let authority = Keypair::new();
+        let participant = Keypair::new();
+        svm.airdrop(&participant.pubkey(), 10_000_000_000).unwrap();
+
+        let token_mint = create_mock_token_mint(&mut svm, &authority.pubkey());
+
+        // Started 30 days ago, fully vested
+        let start_timestamp = (JAN_1_2025 - (ONE_DAY * 30) as i64) as u64;
+        let allocated = 1_000_000u64;
+
+        let schedule = create_vest_schedule(
+            &mut svm,
+            &authority.pubkey(),
+            &token_mint,
+            1,
+            start_timestamp,
+            ONE_DAY,
+            ONE_DAY * 10,
+            ONE_DAY,
+        );
+
+        let participant_state = create_participant_state(
+            &mut svm,
+            &participant.pubkey(),
+            &schedule,
+            allocated,
+            0,
+        );
+
+        // Vault owned by schedule
+        let vault = create_ata_with_balance(&mut svm, &schedule, &token_mint, allocated);
+        let participant_ata =
+            create_ata_with_balance(&mut svm, &participant.pubkey(), &token_mint, 0);
+
+        let instruction = build_claim_instruction(
+            &participant.pubkey(),
+            &participant_state,
+            &participant_ata,
+            &schedule,
+            &vault,
+            &token_mint,
+        );
+
+        let tx = Transaction::new_signed_with_payer(
+            &[instruction],
+            Some(&participant.pubkey()),
+            &[&participant],
+            svm.latest_blockhash(),
+        );
+
+        let result = svm.send_transaction(tx);
+        print_transaction_logs(&result);
+        assert!(result.is_ok(), "Fully vested claim should succeed");
+
+        // Verify transfer
+        let ata_account = svm.get_account(&participant_ata).unwrap();
+        let token_data = TokenAccount::unpack(&ata_account.data).unwrap();
+        assert_eq!(token_data.amount, allocated);
+
+        // Verify vault is empty
+        let vault_account = svm.get_account(&vault).unwrap();
+        let vault_data = TokenAccount::unpack(&vault_account.data).unwrap();
+        assert_eq!(vault_data.amount, 0);
+    }
+
+    #[test]
+    fn test_claim_partial_vesting() {
+        let mut svm = setup_svm();
+
+        let authority = Keypair::new();
+        let participant = Keypair::new();
+        svm.airdrop(&participant.pubkey(), 10_000_000_000).unwrap();
+
+        let token_mint = create_mock_token_mint(&mut svm, &authority.pubkey());
+
+        // Started 3 days ago, cliff 1 day, 10 day total, 1 day steps
+        // 2 steps completed = 2/9 vested
+        let start_timestamp = (JAN_1_2025 - (ONE_DAY * 3) as i64) as u64;
+        let allocated = 900_000u64; // Divisible by 9
+
+        let schedule = create_vest_schedule(
+            &mut svm,
+            &authority.pubkey(),
+            &token_mint,
+            2,
+            start_timestamp,
+            ONE_DAY,
+            ONE_DAY * 10,
+            ONE_DAY,
+        );
+
+        let participant_state = create_participant_state(
+            &mut svm,
+            &participant.pubkey(),
+            &schedule,
+            allocated,
+            0,
+        );
+
+        let vault = create_ata_with_balance(&mut svm, &schedule, &token_mint, allocated);
+        let participant_ata =
+            create_ata_with_balance(&mut svm, &participant.pubkey(), &token_mint, 0);
+
+        let instruction = build_claim_instruction(
+            &participant.pubkey(),
+            &participant_state,
+            &participant_ata,
+            &schedule,
+            &vault,
+            &token_mint,
+        );
+
+        let tx = Transaction::new_signed_with_payer(
+            &[instruction],
+            Some(&participant.pubkey()),
+            &[&participant],
+            svm.latest_blockhash(),
+        );
+
+        let result = svm.send_transaction(tx);
+        print_transaction_logs(&result);
+        assert!(result.is_ok(), "Partial claim should succeed");
+
+        // 2/9 of 900,000 = 200,000
+        let expected_claim = 200_000u64;
+        let ata_account = svm.get_account(&participant_ata).unwrap();
+        let token_data = TokenAccount::unpack(&ata_account.data).unwrap();
+        assert_eq!(token_data.amount, expected_claim);
+    }
+
     #[test]
     fn test_claim_exactly_at_cliff_end() {
         let mut svm = setup_svm();
@@ -255,26 +410,22 @@ mod claim_tests {
         svm.airdrop(&participant.pubkey(), 10_000_000_000).unwrap();
 
         let token_mint = create_mock_token_mint(&mut svm, &authority.pubkey());
-        
-        // Schedule: started Dec 30, 2024, cliff = 1 day, step = 1 day
-        // Cliff ends Dec 31, first step completes Jan 1 at 00:00:00
+
+        // Started Dec 30, cliff ends Dec 31, first step completes Jan 1
         let start_timestamp = (JAN_1_2025 - (ONE_DAY * 2) as i64) as u64;
-        let cliff_duration = ONE_DAY;
-        let total_duration = ONE_DAY * 10;
-        let step_duration = ONE_DAY;
+        let allocated = 900_000u64;
 
         let schedule = create_vest_schedule(
             &mut svm,
             &authority.pubkey(),
             &token_mint,
-            1,
+            3,
             start_timestamp,
-            cliff_duration,
-            total_duration,
-            step_duration,
+            ONE_DAY,
+            ONE_DAY * 10,
+            ONE_DAY,
         );
 
-        let allocated = 1_000_000u64;
         let participant_state = create_participant_state(
             &mut svm,
             &participant.pubkey(),
@@ -283,8 +434,9 @@ mod claim_tests {
             0,
         );
 
-        let vault = create_ata_with_balance(&mut svm, &participant_state, &token_mint, allocated);
-        let participant_ata = create_ata_with_balance(&mut svm, &participant.pubkey(), &token_mint, 0);
+        let vault = create_ata_with_balance(&mut svm, &schedule, &token_mint, allocated);
+        let participant_ata =
+            create_ata_with_balance(&mut svm, &participant.pubkey(), &token_mint, 0);
 
         let instruction = build_claim_instruction(
             &participant.pubkey(),
@@ -292,6 +444,7 @@ mod claim_tests {
             &participant_ata,
             &schedule,
             &vault,
+            &token_mint,
         );
 
         let tx = Transaction::new_signed_with_payer(
@@ -306,9 +459,8 @@ mod claim_tests {
         assert!(result.is_ok(), "Should succeed at first claimable moment");
     }
 
-    /// Claim 1 second before cliff ends (should fail)
     #[test]
-    fn test_claim_one_second_before_cliff() {
+    fn test_claim_multiple_times() {
         let mut svm = setup_svm();
 
         let authority = Keypair::new();
@@ -316,25 +468,22 @@ mod claim_tests {
         svm.airdrop(&participant.pubkey(), 10_000_000_000).unwrap();
 
         let token_mint = create_mock_token_mint(&mut svm, &authority.pubkey());
-        
-        // Cliff ends 1 second after current time
-        let start_timestamp = (JAN_1_2025 - ONE_DAY as i64 + 1) as u64;
-        let cliff_duration = ONE_DAY;
-        let total_duration = ONE_DAY * 10;
-        let step_duration = ONE_DAY;
+
+        // Started 3 days ago
+        let start_timestamp = (JAN_1_2025 - (ONE_DAY * 3) as i64) as u64;
+        let allocated = 900_000u64;
 
         let schedule = create_vest_schedule(
             &mut svm,
             &authority.pubkey(),
             &token_mint,
-            2,
+            4,
             start_timestamp,
-            cliff_duration,
-            total_duration,
-            step_duration,
+            ONE_DAY,
+            ONE_DAY * 10,
+            ONE_DAY,
         );
 
-        let allocated = 1_000_000u64;
         let participant_state = create_participant_state(
             &mut svm,
             &participant.pubkey(),
@@ -343,15 +492,18 @@ mod claim_tests {
             0,
         );
 
-        let vault = create_ata_with_balance(&mut svm, &participant_state, &token_mint, allocated);
-        let participant_ata = create_ata_with_balance(&mut svm, &participant.pubkey(), &token_mint, 0);
+        let vault = create_ata_with_balance(&mut svm, &schedule, &token_mint, allocated);
+        let participant_ata =
+            create_ata_with_balance(&mut svm, &participant.pubkey(), &token_mint, 0);
 
+        // First claim
         let instruction = build_claim_instruction(
             &participant.pubkey(),
             &participant_state,
             &participant_ata,
             &schedule,
             &vault,
+            &token_mint,
         );
 
         let tx = Transaction::new_signed_with_payer(
@@ -363,10 +515,99 @@ mod claim_tests {
 
         let result = svm.send_transaction(tx);
         print_transaction_logs(&result);
-        assert!(result.is_err(), "Should fail 1 second before cliff");
+        assert!(result.is_ok(), "First claim should succeed");
+
+        // Warp forward 2 more days
+        warp_to_timestamp(&mut svm, JAN_1_2025 + (ONE_DAY * 2) as i64);
+
+        // Second claim
+        let instruction2 = build_claim_instruction(
+            &participant.pubkey(),
+            &participant_state,
+            &participant_ata,
+            &schedule,
+            &vault,
+            &token_mint,
+        );
+
+        let tx2 = Transaction::new_signed_with_payer(
+            &[instruction2],
+            Some(&participant.pubkey()),
+            &[&participant],
+            svm.latest_blockhash(),
+        );
+
+        let result2 = svm.send_transaction(tx2);
+        print_transaction_logs(&result2);
+        assert!(result2.is_ok(), "Second claim should succeed");
+
+        // Should have claimed 4/9 total now
+        let expected_total = 400_000u64;
+        let ata_account = svm.get_account(&participant_ata).unwrap();
+        let token_data = TokenAccount::unpack(&ata_account.data).unwrap();
+        assert_eq!(token_data.amount, expected_total);
     }
 
-    /// Claim exactly at cliff end but 0 steps elapsed (should fail - nothing claimable yet)
+    // ==================== FAILURE CASES ====================
+
+    #[test]
+    fn test_claim_before_cliff() {
+        let mut svm = setup_svm();
+
+        let authority = Keypair::new();
+        let participant = Keypair::new();
+        svm.airdrop(&participant.pubkey(), 10_000_000_000).unwrap();
+
+        let token_mint = create_mock_token_mint(&mut svm, &authority.pubkey());
+
+        // Cliff ends 1 second after current time
+        let start_timestamp = (JAN_1_2025 - ONE_DAY as i64 + 1) as u64;
+        let allocated = 1_000_000u64;
+
+        let schedule = create_vest_schedule(
+            &mut svm,
+            &authority.pubkey(),
+            &token_mint,
+            10,
+            start_timestamp,
+            ONE_DAY,
+            ONE_DAY * 10,
+            ONE_DAY,
+        );
+
+        let participant_state = create_participant_state(
+            &mut svm,
+            &participant.pubkey(),
+            &schedule,
+            allocated,
+            0,
+        );
+
+        let vault = create_ata_with_balance(&mut svm, &schedule, &token_mint, allocated);
+        let participant_ata =
+            create_ata_with_balance(&mut svm, &participant.pubkey(), &token_mint, 0);
+
+        let instruction = build_claim_instruction(
+            &participant.pubkey(),
+            &participant_state,
+            &participant_ata,
+            &schedule,
+            &vault,
+            &token_mint,
+        );
+
+        let tx = Transaction::new_signed_with_payer(
+            &[instruction],
+            Some(&participant.pubkey()),
+            &[&participant],
+            svm.latest_blockhash(),
+        );
+
+        let result = svm.send_transaction(tx);
+        print_transaction_logs(&result);
+        assert!(result.is_err(), "Should fail before cliff");
+    }
+
     #[test]
     fn test_claim_at_cliff_end_zero_steps() {
         let mut svm = setup_svm();
@@ -376,25 +617,22 @@ mod claim_tests {
         svm.airdrop(&participant.pubkey(), 10_000_000_000).unwrap();
 
         let token_mint = create_mock_token_mint(&mut svm, &authority.pubkey());
-        
-        // Cliff ends exactly at Jan 1, 2025 but no steps have completed
+
+        // Cliff ends exactly now but no steps completed
         let start_timestamp = (JAN_1_2025 - ONE_DAY as i64) as u64;
-        let cliff_duration = ONE_DAY;
-        let total_duration = ONE_DAY * 10;
-        let step_duration = ONE_DAY;
+        let allocated = 1_000_000u64;
 
         let schedule = create_vest_schedule(
             &mut svm,
             &authority.pubkey(),
             &token_mint,
-            20,
+            11,
             start_timestamp,
-            cliff_duration,
-            total_duration,
-            step_duration,
+            ONE_DAY,
+            ONE_DAY * 10,
+            ONE_DAY,
         );
 
-        let allocated = 1_000_000u64;
         let participant_state = create_participant_state(
             &mut svm,
             &participant.pubkey(),
@@ -403,8 +641,9 @@ mod claim_tests {
             0,
         );
 
-        let vault = create_ata_with_balance(&mut svm, &participant_state, &token_mint, allocated);
-        let participant_ata = create_ata_with_balance(&mut svm, &participant.pubkey(), &token_mint, 0);
+        let vault = create_ata_with_balance(&mut svm, &schedule, &token_mint, allocated);
+        let participant_ata =
+            create_ata_with_balance(&mut svm, &participant.pubkey(), &token_mint, 0);
 
         let instruction = build_claim_instruction(
             &participant.pubkey(),
@@ -412,6 +651,7 @@ mod claim_tests {
             &participant_ata,
             &schedule,
             &vault,
+            &token_mint,
         );
 
         let tx = Transaction::new_signed_with_payer(
@@ -423,10 +663,9 @@ mod claim_tests {
 
         let result = svm.send_transaction(tx);
         print_transaction_logs(&result);
-        assert!(result.is_err(), "Should fail at cliff end with 0 steps elapsed");
+        assert!(result.is_err(), "Should fail at cliff end with 0 steps");
     }
 
-    /// Claim when already claimed everything vested so far
     #[test]
     fn test_claim_nothing_new_to_claim() {
         let mut svm = setup_svm();
@@ -436,27 +675,21 @@ mod claim_tests {
         svm.airdrop(&participant.pubkey(), 10_000_000_000).unwrap();
 
         let token_mint = create_mock_token_mint(&mut svm, &authority.pubkey());
-        
-        // Started 2 days ago, cliff 1 day, 10 day total, 1 day steps
-        // At day 2: 1 step completed = 1/9 vested ≈ 111,111
+
+        // Started 2 days ago, 1 step completed = 1/9 vested
         let start_timestamp = (JAN_1_2025 - (ONE_DAY * 2) as i64) as u64;
-        let cliff_duration = ONE_DAY;
-        let total_duration = ONE_DAY * 10;
-        let step_duration = ONE_DAY;
-        let allocated = 1_000_000u64;
-        
-        // Already claimed the 1 step worth
-        let already_claimed = allocated / 9;
+        let allocated = 900_000u64;
+        let already_claimed = 100_000u64; // Already claimed the 1 step
 
         let schedule = create_vest_schedule(
             &mut svm,
             &authority.pubkey(),
             &token_mint,
-            3,
+            12,
             start_timestamp,
-            cliff_duration,
-            total_duration,
-            step_duration,
+            ONE_DAY,
+            ONE_DAY * 10,
+            ONE_DAY,
         );
 
         let participant_state = create_participant_state(
@@ -469,16 +702,12 @@ mod claim_tests {
 
         let vault = create_ata_with_balance(
             &mut svm,
-            &participant_state,
+            &schedule,
             &token_mint,
             allocated - already_claimed,
         );
-        let participant_ata = create_ata_with_balance(
-            &mut svm,
-            &participant.pubkey(),
-            &token_mint,
-            already_claimed,
-        );
+        let participant_ata =
+            create_ata_with_balance(&mut svm, &participant.pubkey(), &token_mint, already_claimed);
 
         let instruction = build_claim_instruction(
             &participant.pubkey(),
@@ -486,6 +715,7 @@ mod claim_tests {
             &participant_ata,
             &schedule,
             &vault,
+            &token_mint,
         );
 
         let tx = Transaction::new_signed_with_payer(
@@ -500,9 +730,8 @@ mod claim_tests {
         assert!(result.is_err(), "Should fail when nothing new to claim");
     }
 
-    /// Vault has less tokens than claimable (drained vault)
     #[test]
-    fn test_claim_vault_drained() {
+    fn test_claim_vault_insufficient_balance() {
         let mut svm = setup_svm();
 
         let authority = Keypair::new();
@@ -510,23 +739,20 @@ mod claim_tests {
         svm.airdrop(&participant.pubkey(), 10_000_000_000).unwrap();
 
         let token_mint = create_mock_token_mint(&mut svm, &authority.pubkey());
-        
-        // Fully vested schedule
+
+        // Fully vested
         let start_timestamp = (JAN_1_2025 - (ONE_DAY * 30) as i64) as u64;
-        let cliff_duration = ONE_DAY;
-        let total_duration = ONE_DAY * 10;
-        let step_duration = ONE_DAY;
         let allocated = 1_000_000u64;
 
         let schedule = create_vest_schedule(
             &mut svm,
             &authority.pubkey(),
             &token_mint,
-            4,
+            13,
             start_timestamp,
-            cliff_duration,
-            total_duration,
-            step_duration,
+            ONE_DAY,
+            ONE_DAY * 10,
+            ONE_DAY,
         );
 
         let participant_state = create_participant_state(
@@ -538,8 +764,9 @@ mod claim_tests {
         );
 
         // Vault only has 1 token
-        let vault = create_ata_with_balance(&mut svm, &participant_state, &token_mint, 1);
-        let participant_ata = create_ata_with_balance(&mut svm, &participant.pubkey(), &token_mint, 0);
+        let vault = create_ata_with_balance(&mut svm, &schedule, &token_mint, 1);
+        let participant_ata =
+            create_ata_with_balance(&mut svm, &participant.pubkey(), &token_mint, 0);
 
         let instruction = build_claim_instruction(
             &participant.pubkey(),
@@ -547,6 +774,7 @@ mod claim_tests {
             &participant_ata,
             &schedule,
             &vault,
+            &token_mint,
         );
 
         let tx = Transaction::new_signed_with_payer(
@@ -561,7 +789,6 @@ mod claim_tests {
         assert!(result.is_err(), "Should fail with insufficient vault balance");
     }
 
-    /// Wrong participant tries to claim
     #[test]
     fn test_claim_wrong_signer() {
         let mut svm = setup_svm();
@@ -572,22 +799,19 @@ mod claim_tests {
         svm.airdrop(&attacker.pubkey(), 10_000_000_000).unwrap();
 
         let token_mint = create_mock_token_mint(&mut svm, &authority.pubkey());
-        
+
         let start_timestamp = (JAN_1_2025 - (ONE_DAY * 5) as i64) as u64;
-        let cliff_duration = ONE_DAY;
-        let total_duration = ONE_DAY * 10;
-        let step_duration = ONE_DAY;
         let allocated = 1_000_000u64;
 
         let schedule = create_vest_schedule(
             &mut svm,
             &authority.pubkey(),
             &token_mint,
-            5,
+            14,
             start_timestamp,
-            cliff_duration,
-            total_duration,
-            step_duration,
+            ONE_DAY,
+            ONE_DAY * 10,
+            ONE_DAY,
         );
 
         let participant_state = create_participant_state(
@@ -598,16 +822,18 @@ mod claim_tests {
             0,
         );
 
-        let vault = create_ata_with_balance(&mut svm, &participant_state, &token_mint, allocated);
-        let participant_ata = create_ata_with_balance(&mut svm, &real_participant.pubkey(), &token_mint, 0);
+        let vault = create_ata_with_balance(&mut svm, &schedule, &token_mint, allocated);
+        let participant_ata =
+            create_ata_with_balance(&mut svm, &real_participant.pubkey(), &token_mint, 0);
 
-        // Attacker signs
+        // Attacker tries to claim
         let instruction = build_claim_instruction(
             &attacker.pubkey(),
             &participant_state,
             &participant_ata,
             &schedule,
             &vault,
+            &token_mint,
         );
 
         let tx = Transaction::new_signed_with_payer(
@@ -622,9 +848,8 @@ mod claim_tests {
         assert!(result.is_err(), "Should fail with wrong signer");
     }
 
-    /// Mismatched schedule
     #[test]
-    fn test_claim_schedule_mismatch() {
+    fn test_claim_wrong_schedule() {
         let mut svm = setup_svm();
 
         let authority = Keypair::new();
@@ -632,7 +857,7 @@ mod claim_tests {
         svm.airdrop(&participant.pubkey(), 10_000_000_000).unwrap();
 
         let token_mint = create_mock_token_mint(&mut svm, &authority.pubkey());
-        
+
         let start_timestamp = (JAN_1_2025 - (ONE_DAY * 5) as i64) as u64;
 
         let schedule_1 = create_vest_schedule(
@@ -657,7 +882,7 @@ mod claim_tests {
             ONE_DAY,
         );
 
-        // Linked to schedule_1
+        // Participant linked to schedule_1
         let participant_state = create_participant_state(
             &mut svm,
             &participant.pubkey(),
@@ -666,72 +891,18 @@ mod claim_tests {
             0,
         );
 
-        let vault = create_ata_with_balance(&mut svm, &participant_state, &token_mint, 1_000_000);
-        let participant_ata = create_ata_with_balance(&mut svm, &participant.pubkey(), &token_mint, 0);
+        let vault = create_ata_with_balance(&mut svm, &schedule_1, &token_mint, 1_000_000);
+        let participant_ata =
+            create_ata_with_balance(&mut svm, &participant.pubkey(), &token_mint, 0);
 
-        // Use schedule_2
+        // Try to use schedule_2
         let instruction = build_claim_instruction(
             &participant.pubkey(),
             &participant_state,
             &participant_ata,
             &schedule_2,
             &vault,
-        );
-
-        let tx = Transaction::new_signed_with_payer(
-            &[instruction],
-            Some(&participant.pubkey()),
-            &[&participant],
-            svm.latest_blockhash(),
-        );
-
-        let result = svm.send_transaction(tx);
-        print_transaction_logs(&result);
-        assert!(result.is_err(), "Should fail with schedule mismatch");
-    }
-
-    /// Wrong destination ATA
-    #[test]
-    fn test_claim_wrong_destination_ata() {
-        let mut svm = setup_svm();
-
-        let authority = Keypair::new();
-        let participant = Keypair::new();
-        let attacker = Keypair::new();
-        svm.airdrop(&participant.pubkey(), 10_000_000_000).unwrap();
-
-        let token_mint = create_mock_token_mint(&mut svm, &authority.pubkey());
-        
-        let start_timestamp = (JAN_1_2025 - (ONE_DAY * 5) as i64) as u64;
-
-        let schedule = create_vest_schedule(
-            &mut svm,
-            &authority.pubkey(),
             &token_mint,
-            6,
-            start_timestamp,
-            ONE_DAY,
-            ONE_DAY * 10,
-            ONE_DAY,
-        );
-
-        let participant_state = create_participant_state(
-            &mut svm,
-            &participant.pubkey(),
-            &schedule,
-            1_000_000,
-            0,
-        );
-
-        let vault = create_ata_with_balance(&mut svm, &participant_state, &token_mint, 1_000_000);
-        let attacker_ata = create_ata_with_balance(&mut svm, &attacker.pubkey(), &token_mint, 0);
-
-        let instruction = build_claim_instruction(
-            &participant.pubkey(),
-            &participant_state,
-            &attacker_ata,
-            &schedule,
-            &vault,
         );
 
         let tx = Transaction::new_signed_with_payer(
@@ -743,12 +914,11 @@ mod claim_tests {
 
         let result = svm.send_transaction(tx);
         print_transaction_logs(&result);
-        assert!(result.is_err(), "Should fail with wrong destination ATA");
+        assert!(result.is_err(), "Should fail with wrong schedule");
     }
 
-    /// Double claim in same TX
     #[test]
-    fn test_double_claim_same_tx() {
+    fn test_claim_wrong_token_mint() {
         let mut svm = setup_svm();
 
         let authority = Keypair::new();
@@ -756,15 +926,16 @@ mod claim_tests {
         svm.airdrop(&participant.pubkey(), 10_000_000_000).unwrap();
 
         let token_mint = create_mock_token_mint(&mut svm, &authority.pubkey());
-        
-        let start_timestamp = (JAN_1_2025 - (ONE_DAY * 15) as i64) as u64;
+        let wrong_mint = create_mock_token_mint(&mut svm, &authority.pubkey());
+
+        let start_timestamp = (JAN_1_2025 - (ONE_DAY * 5) as i64) as u64;
         let allocated = 1_000_000u64;
 
         let schedule = create_vest_schedule(
             &mut svm,
             &authority.pubkey(),
             &token_mint,
-            7,
+            15,
             start_timestamp,
             ONE_DAY,
             ONE_DAY * 10,
@@ -779,8 +950,134 @@ mod claim_tests {
             0,
         );
 
-        let vault = create_ata_with_balance(&mut svm, &participant_state, &token_mint, allocated);
-        let participant_ata = create_ata_with_balance(&mut svm, &participant.pubkey(), &token_mint, 0);
+        let vault = create_ata_with_balance(&mut svm, &schedule, &token_mint, allocated);
+        let participant_ata =
+            create_ata_with_balance(&mut svm, &participant.pubkey(), &token_mint, 0);
+
+        // Pass wrong mint
+        let instruction = build_claim_instruction(
+            &participant.pubkey(),
+            &participant_state,
+            &participant_ata,
+            &schedule,
+            &vault,
+            &wrong_mint,
+        );
+
+        let tx = Transaction::new_signed_with_payer(
+            &[instruction],
+            Some(&participant.pubkey()),
+            &[&participant],
+            svm.latest_blockhash(),
+        );
+
+        let result = svm.send_transaction(tx);
+        print_transaction_logs(&result);
+        assert!(result.is_err(), "Should fail with wrong token mint");
+    }
+
+    #[test]
+    fn test_claim_participant_not_signer() {
+        let mut svm = setup_svm();
+
+        let authority = Keypair::new();
+        let participant = Keypair::new();
+        let payer = Keypair::new();
+        svm.airdrop(&payer.pubkey(), 10_000_000_000).unwrap();
+
+        let token_mint = create_mock_token_mint(&mut svm, &authority.pubkey());
+
+        let start_timestamp = (JAN_1_2025 - (ONE_DAY * 5) as i64) as u64;
+        let allocated = 1_000_000u64;
+
+        let schedule = create_vest_schedule(
+            &mut svm,
+            &authority.pubkey(),
+            &token_mint,
+            16,
+            start_timestamp,
+            ONE_DAY,
+            ONE_DAY * 10,
+            ONE_DAY,
+        );
+
+        let participant_state = create_participant_state(
+            &mut svm,
+            &participant.pubkey(),
+            &schedule,
+            allocated,
+            0,
+        );
+
+        let vault = create_ata_with_balance(&mut svm, &schedule, &token_mint, allocated);
+        let participant_ata =
+            create_ata_with_balance(&mut svm, &participant.pubkey(), &token_mint, 0);
+
+        // Participant NOT marked as signer
+        let instruction = Instruction {
+            program_id: PROGRAM_ID,
+            accounts: vec![
+                AccountMeta::new(participant.pubkey(), false), // Not signer!
+                AccountMeta::new(participant_state, false),
+                AccountMeta::new(participant_ata, false),
+                AccountMeta::new(schedule, false),
+                AccountMeta::new(vault, false),
+                AccountMeta::new_readonly(token_mint, false),
+                AccountMeta::new_readonly(ID.into(), false),
+                AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),
+                AccountMeta::new_readonly(ATA_PROGRAM_ID, false),
+            ],
+            data: create_claim_instruction_data(),
+        };
+
+        let tx = Transaction::new_signed_with_payer(
+            &[instruction],
+            Some(&payer.pubkey()),
+            &[&payer],
+            svm.latest_blockhash(),
+        );
+
+        let result = svm.send_transaction(tx);
+        print_transaction_logs(&result);
+        assert!(result.is_err(), "Should fail when participant not signer");
+    }
+
+    #[test]
+    fn test_claim_double_claim_same_tx() {
+        let mut svm = setup_svm();
+
+        let authority = Keypair::new();
+        let participant = Keypair::new();
+        svm.airdrop(&participant.pubkey(), 10_000_000_000).unwrap();
+
+        let token_mint = create_mock_token_mint(&mut svm, &authority.pubkey());
+
+        // Fully vested
+        let start_timestamp = (JAN_1_2025 - (ONE_DAY * 15) as i64) as u64;
+        let allocated = 1_000_000u64;
+
+        let schedule = create_vest_schedule(
+            &mut svm,
+            &authority.pubkey(),
+            &token_mint,
+            17,
+            start_timestamp,
+            ONE_DAY,
+            ONE_DAY * 10,
+            ONE_DAY,
+        );
+
+        let participant_state = create_participant_state(
+            &mut svm,
+            &participant.pubkey(),
+            &schedule,
+            allocated,
+            0,
+        );
+
+        let vault = create_ata_with_balance(&mut svm, &schedule, &token_mint, allocated);
+        let participant_ata =
+            create_ata_with_balance(&mut svm, &participant.pubkey(), &token_mint, 0);
 
         let instruction = build_claim_instruction(
             &participant.pubkey(),
@@ -788,6 +1085,7 @@ mod claim_tests {
             &participant_ata,
             &schedule,
             &vault,
+            &token_mint,
         );
 
         // Two claims in one TX
@@ -803,80 +1101,25 @@ mod claim_tests {
         assert!(result.is_err(), "Double claim in same TX should fail");
     }
 
-    /// Zero allocation
     #[test]
-    fn test_claim_zero_allocation() {
+    fn test_claim_wrong_vault() {
         let mut svm = setup_svm();
 
         let authority = Keypair::new();
         let participant = Keypair::new();
+        let random_owner = Keypair::new();
         svm.airdrop(&participant.pubkey(), 10_000_000_000).unwrap();
 
         let token_mint = create_mock_token_mint(&mut svm, &authority.pubkey());
-        
+
         let start_timestamp = (JAN_1_2025 - (ONE_DAY * 5) as i64) as u64;
-
-        let schedule = create_vest_schedule(
-            &mut svm,
-            &authority.pubkey(),
-            &token_mint,
-            8,
-            start_timestamp,
-            ONE_DAY,
-            ONE_DAY * 10,
-            ONE_DAY,
-        );
-
-        let participant_state = create_participant_state(
-            &mut svm,
-            &participant.pubkey(),
-            &schedule,
-            0,
-            0,
-        );
-
-        let vault = create_ata_with_balance(&mut svm, &participant_state, &token_mint, 0);
-        let participant_ata = create_ata_with_balance(&mut svm, &participant.pubkey(), &token_mint, 0);
-
-        let instruction = build_claim_instruction(
-            &participant.pubkey(),
-            &participant_state,
-            &participant_ata,
-            &schedule,
-            &vault,
-        );
-
-        let tx = Transaction::new_signed_with_payer(
-            &[instruction],
-            Some(&participant.pubkey()),
-            &[&participant],
-            svm.latest_blockhash(),
-        );
-
-        let result = svm.send_transaction(tx);
-        print_transaction_logs(&result);
-        assert!(result.is_err(), "Should fail with zero allocation");
-    }
-
-    /// Success: fully vested claim
-    #[test]
-    fn test_claim_success_fully_vested() {
-        let mut svm = setup_svm();
-
-        let authority = Keypair::new();
-        let participant = Keypair::new();
-        svm.airdrop(&participant.pubkey(), 10_000_000_000).unwrap();
-
-        let token_mint = create_mock_token_mint(&mut svm, &authority.pubkey());
-        
-        let start_timestamp = (JAN_1_2025 - (ONE_DAY * 30) as i64) as u64;
         let allocated = 1_000_000u64;
 
         let schedule = create_vest_schedule(
             &mut svm,
             &authority.pubkey(),
             &token_mint,
-            9,
+            18,
             start_timestamp,
             ONE_DAY,
             ONE_DAY * 10,
@@ -891,15 +1134,19 @@ mod claim_tests {
             0,
         );
 
-        let vault = create_ata_with_balance(&mut svm, &participant_state, &token_mint, allocated);
-        let participant_ata = create_ata_with_balance(&mut svm, &participant.pubkey(), &token_mint, 0);
+        // Wrong vault (owned by random, not schedule)
+        let wrong_vault =
+            create_ata_with_balance(&mut svm, &random_owner.pubkey(), &token_mint, allocated);
+        let participant_ata =
+            create_ata_with_balance(&mut svm, &participant.pubkey(), &token_mint, 0);
 
         let instruction = build_claim_instruction(
             &participant.pubkey(),
             &participant_state,
             &participant_ata,
             &schedule,
-            &vault,
+            &wrong_vault,
+            &token_mint,
         );
 
         let tx = Transaction::new_signed_with_payer(
@@ -911,11 +1158,38 @@ mod claim_tests {
 
         let result = svm.send_transaction(tx);
         print_transaction_logs(&result);
-        assert!(result.is_ok(), "Fully vested claim should succeed");
+        assert!(result.is_err(), "Should fail with wrong vault");
+    }
 
-        // Verify transfer
-        let ata_account = svm.get_account(&participant_ata).unwrap();
-        let token_data = TokenAccount::unpack(&ata_account.data).unwrap();
-        assert_eq!(token_data.amount, allocated);
+    #[test]
+    fn test_claim_insufficient_accounts() {
+        let mut svm = setup_svm();
+
+        let participant = Keypair::new();
+        svm.airdrop(&participant.pubkey(), 10_000_000_000).unwrap();
+
+        // Only 5 accounts instead of 9
+        let instruction = Instruction {
+            program_id: PROGRAM_ID,
+            accounts: vec![
+                AccountMeta::new(participant.pubkey(), true),
+                AccountMeta::new(Pubkey::new_unique(), false),
+                AccountMeta::new(Pubkey::new_unique(), false),
+                AccountMeta::new(Pubkey::new_unique(), false),
+                AccountMeta::new(Pubkey::new_unique(), false),
+            ],
+            data: create_claim_instruction_data(),
+        };
+
+        let tx = Transaction::new_signed_with_payer(
+            &[instruction],
+            Some(&participant.pubkey()),
+            &[&participant],
+            svm.latest_blockhash(),
+        );
+
+        let result = svm.send_transaction(tx);
+        print_transaction_logs(&result);
+        assert!(result.is_err(), "Should fail with insufficient accounts");
     }
 }

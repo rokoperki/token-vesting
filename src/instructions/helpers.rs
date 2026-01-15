@@ -44,31 +44,37 @@ impl ProgramAccount {
         }
         Ok(())
     }
+
+    pub fn check_ata_program(
+        account: &pinocchio::account_info::AccountInfo,
+    ) -> Result<(), pinocchio::program_error::ProgramError> {
+        if account.key() != &pinocchio_associated_token_account::ID {
+            return Err(PinocchioError::InvalidOwner.into());
+        }
+        Ok(())
+    }
+}
+
+pub trait Discriminator {
+    const LEN: usize;
+    const DISCRIMINATOR: u8;
 }
 
 impl ProgramAccount {
-    pub fn check_schedule(account: &AccountInfo) -> Result<(), ProgramError> {
+    pub fn check<T: Discriminator>(account: &AccountInfo) -> Result<(), ProgramError> {
         if !account.is_owned_by(&crate::ID) {
             return Err(PinocchioError::InvalidOwner.into());
         }
 
-        if account
-            .data_len()
-            .ne(&crate::schedule_state::VestSchedule::LEN)
-        {
+        if account.data_len() != T::LEN {
             return Err(PinocchioError::InvalidAccountData.into());
         }
-        // nije lose dodat accountu discriminator na prvom byteu pa to provjeriti
-        Ok(())
-    }
 
-    pub fn check_participant(account: &AccountInfo) -> Result<(), ProgramError> {
-        if !account.is_owned_by(&crate::ID) {
-            return Err(PinocchioError::InvalidOwner.into());
+        let data = account.try_borrow_data()?;
+        if data[0] != T::DISCRIMINATOR {
+            return Err(PinocchioError::InvalidDiscriminator.into());
         }
-        if account.data_len() != crate::participant_state::VestParticipant::LEN {
-            return Err(PinocchioError::InvalidAccountData.into());
-        }
+
         Ok(())
     }
 
