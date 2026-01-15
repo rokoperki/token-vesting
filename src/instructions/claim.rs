@@ -146,6 +146,7 @@ impl<'a> Claim<'a> {
 
         Transfer {
             from: self.accounts.vault,
+            // nebi bilo lose imat provjeru jeli useru otvorena ata za taj mint i ako nije mozda je i otvoriti
             to: self.accounts.participant_ata,
             authority: self.accounts.participant_state,
             amount: claimable_amount,

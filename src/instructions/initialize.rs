@@ -12,6 +12,7 @@ pub struct InitializeAccounts<'a> {
     pub initializer: &'a AccountInfo,
     pub vest_schedule: &'a AccountInfo,
     pub token_mint: &'a AccountInfo,
+    // ode bi jos dodao vault accoung odnosno schedule atu i inicijalizirao u ovoj instrukciji tu ATAu
     pub system_program: &'a AccountInfo,
     pub token_program: &'a AccountInfo,
 }
@@ -140,13 +141,16 @@ impl<'a> Initialize<'a> {
         let vest_schedule_seed = [
             Seed::from(b"vest_schedule"),
             Seed::from(&seed_binding),
+            // nema bas razloga za koristit mint kao dio seeda
             Seed::from(self.accounts.token_mint.key().as_ref()),
+            // nema bas razloga za koristit intiializera kao dio seeda
             Seed::from(self.accounts.initializer.key().as_ref()),
             Seed::from(&binding),
         ];
 
         ProgramAccount::init::<VestSchedule>(
             self.accounts.initializer,
+            // dodati provjeru da account nije vec initializiran
             self.accounts.vest_schedule,
             &vest_schedule_seed,
             VestSchedule::LEN,

@@ -52,6 +52,7 @@ impl VestSchedule {
         }
 
         if current_timestamp >= self.start_timestamp + self.total_duration {
+            // vise volim koristit checked_sub jer nebi smilo nikad overflowat, pa ako se dogodi znaci da je neki problem i bolje da dobijemo error
             return total_allocated_amount.saturating_sub(claimed_amount);
         }
 
@@ -65,7 +66,7 @@ impl VestSchedule {
 
         vested_amount.saturating_sub(claimed_amount)
     }
-    
+
     #[inline(always)]
     pub fn is_cliff_completed(&self, current_timestamp: u64) -> bool {
         current_timestamp >= self.start_timestamp + self.cliff_duration
