@@ -94,7 +94,6 @@ impl<'a> TryFrom<&'a [AccountInfo]> for Claim<'a> {
                 return Err(ProgramError::InvalidAccountData);
             }
         }
-
         Ok(Self { accounts })
     }
 }
@@ -103,29 +102,39 @@ impl<'a> Claim<'a> {
     pub const DISCRIMINATOR: &'a u8 = &2;
 
     pub fn process(&self) -> Result<(), ProgramError> {
-        let mut vest_schedule_data = self.accounts.vest_schedule.try_borrow_mut_data()?;
-        let vest_schedule = VestSchedule::load_mut(&mut vest_schedule_data)?;
+        let (claimable_amount, allocated_amount, bump) = {
+            let participant_state_data = self.accounts.participant_state.try_borrow_data()?;
+            let participant_state = VestParticipant::load(&participant_state_data)?;
 
-        let mut participant_state_data = self.accounts.participant_state.try_borrow_mut_data()?;
-        let participant_state = VestParticipant::load_mut(&mut participant_state_data)?;
+            let vest_schedule_data = self.accounts.vest_schedule.try_borrow_data()?;
+            let vest_schedule = VestSchedule::load(&vest_schedule_data)?;
 
-        let current_timestamp = Clock::get()?.unix_timestamp as u64;
-        let claimable_amount = vest_schedule.calculate_claimable_amount(
-            current_timestamp,
-            participant_state.allocated_amount(),
-            participant_state.claimed_amount(),
-        );
+            let current_timestamp = Clock::get()?.unix_timestamp as u64;
+            let claimable_amount = vest_schedule.calculate_claimable_amount(
+                current_timestamp,
+                participant_state.allocated_amount(),
+                participant_state.claimed_amount(),
+            );
+
+            (
+                claimable_amount,
+                participant_state.allocated_amount(),
+                participant_state.bump(),
+            )
+        };
 
         if claimable_amount == 0 {
             return Err(PinocchioError::NoClaimableAmount.into());
         }
 
-        let vault_account = TokenAccount::from_account_info(self.accounts.vault)?;
-        if vault_account.amount() < claimable_amount {
-            return Err(ProgramError::InsufficientFunds);
+        {
+            let vault_account = TokenAccount::from_account_info(self.accounts.vault)?;
+            if vault_account.amount() < claimable_amount {
+                return Err(ProgramError::InsufficientFunds);
+            }
         }
 
-        let binding = participant_state.bump().to_le_bytes();
+        let binding = bump.to_le_bytes();
         let participant_seeds = [
             Seed::from(b"vest_participant"),
             Seed::from(self.accounts.participant.key().as_ref()),
@@ -133,7 +142,7 @@ impl<'a> Claim<'a> {
             Seed::from(&binding),
         ];
 
-        let signer = [Signer::from(&participant_seeds)];
+        let signer = Signer::from(&participant_seeds);
 
         Transfer {
             from: self.accounts.vault,
@@ -141,13 +150,16 @@ impl<'a> Claim<'a> {
             authority: self.accounts.participant_state,
             amount: claimable_amount,
         }
-        .invoke_signed(&signer)?;
+        .invoke_signed(&[signer])?;
+
+        let mut participant_state_data = self.accounts.participant_state.try_borrow_mut_data()?;
+        let participant_state = VestParticipant::load_mut(&mut participant_state_data)?;
 
         let new_claimed = participant_state
             .claimed_amount()
             .saturating_add(claimable_amount);
 
-        if new_claimed > participant_state.allocated_amount() {
+        if new_claimed > allocated_amount {
             return Err(PinocchioError::ClaimExceedsAllocation.into());
         }
 
